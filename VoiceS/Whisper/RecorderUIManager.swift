@@ -8,18 +8,16 @@ class RecorderUIManager: ObservableObject {
 
     @Published var recorderType: String = UserDefaults.standard.string(forKey: "RecorderType") ?? "mini" {
         didSet {
-            if isMiniRecorderVisible {
-                if oldValue == "notch" {
-                    notchWindowManager?.hide()
-                    notchWindowManager = nil
-                } else {
-                    miniWindowManager?.hide()
-                    miniWindowManager = nil
-                }
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                    showRecorderPanel()
-                }
+            if oldValue == "notch" {
+                notchWindowManager?.hide()
+                notchWindowManager = nil
+            } else {
+                miniWindowManager?.hide()
+                miniWindowManager = nil
+            }
+
+            Task { @MainActor in
+                syncPanels()
             }
             UserDefaults.standard.set(recorderType, forKey: "RecorderType")
         }
@@ -28,17 +26,14 @@ class RecorderUIManager: ObservableObject {
     @Published var isMiniRecorderVisible = false {
         didSet {
             Task { @MainActor in
-                if isMiniRecorderVisible {
-                    showRecorderPanel()
-                } else {
-                    hideRecorderPanel()
-                }
+                syncPanels()
             }
         }
     }
 
     var notchWindowManager: NotchWindowManager?
     var miniWindowManager: MiniWindowManager?
+    var backgroundProcessingWindowManager: BackgroundProcessingOverlayWindowManager?
 
     private weak var engine: VoiceSEngine?
     private var recorder: Recorder?
@@ -55,6 +50,18 @@ class RecorderUIManager: ObservableObject {
     }
 
     // MARK: - Recorder Panel Management
+
+    func syncPanels() {
+        guard let engine = engine else { return }
+
+        if isMiniRecorderVisible {
+            showRecorderPanel()
+        } else {
+            hideRecorderPanel()
+        }
+
+        syncBackgroundProcessingOverlay(using: engine)
+    }
 
     func showRecorderPanel() {
         guard let engine = engine, let recorder = recorder else { return }
@@ -81,6 +88,26 @@ class RecorderUIManager: ObservableObject {
         }
     }
 
+    private func syncBackgroundProcessingOverlay(using engine: VoiceSEngine) {
+        guard let mode = BackgroundProcessingOverlayMode(
+            backgroundState: engine.backgroundState,
+            isBackgroundProcessing: engine.isBackgroundProcessing
+        ) else {
+            backgroundProcessingWindowManager?.hide()
+            return
+        }
+
+        if backgroundProcessingWindowManager == nil {
+            backgroundProcessingWindowManager = BackgroundProcessingOverlayWindowManager()
+        }
+
+        backgroundProcessingWindowManager?.show(
+            recorderType: recorderType,
+            mode: mode,
+            isRecordingPanelVisible: isMiniRecorderVisible
+        )
+    }
+
     // MARK: - Mini Recorder Management
 
     func toggleMiniRecorder(powerModeId: UUID? = nil) async {
@@ -96,9 +123,16 @@ class RecorderUIManager: ObservableObject {
                 await cancelRecording()
             }
         } else {
+            let startResult = await engine.startRecordingIfPossible(powerModeId: powerModeId)
+            guard startResult == .started else { return }
             SoundManager.shared.playStartSound()
             await MainActor.run { isMiniRecorderVisible = true }
-            await engine.toggleRecord(powerModeId: powerModeId)
+        }
+    }
+
+    func closePanelAfterRecordingStop() async {
+        await MainActor.run {
+            isMiniRecorderVisible = false
         }
     }
 
@@ -125,8 +159,6 @@ class RecorderUIManager: ObservableObject {
             await recorder.stopRecording()
         }
 
-        hideRecorderPanel()
-
         // Clear captured context when the recorder is dismissed
         if let enhancementService = engine.enhancementService {
             await MainActor.run {
@@ -138,7 +170,9 @@ class RecorderUIManager: ObservableObject {
             isMiniRecorderVisible = false
         }
 
-        await engine.cleanupResources()
+        if !engine.isBackgroundProcessing {
+            await engine.cleanupResources()
+        }
 
         if UserDefaults.standard.bool(forKey: PowerModeDefaults.autoRestoreKey) {
             await PowerModeSessionManager.shared.endSession()
@@ -164,13 +198,30 @@ class RecorderUIManager: ObservableObject {
             miniRecorderError = nil
             engine.recordingState = .idle
         }
-        await engine.cleanupResources()
+        backgroundProcessingWindowManager?.hide()
+        if !engine.isBackgroundProcessing {
+            await engine.cleanupResources()
+        }
     }
 
     func cancelRecording() async {
         guard let engine = engine else { return }
         logger.notice("cancelRecording called")
         SoundManager.shared.playEscSound()
+        if engine.recordingState == .recording {
+            engine.shouldCancelRecording = true
+            await engine.toggleRecord()
+            await closePanelAfterRecordingStop()
+
+            if UserDefaults.standard.bool(forKey: PowerModeDefaults.autoRestoreKey) {
+                await PowerModeSessionManager.shared.endSession()
+                await MainActor.run {
+                    PowerModeManager.shared.setActiveConfiguration(nil)
+                }
+            }
+            return
+        }
+
         engine.shouldCancelRecording = true
         await dismissMiniRecorder()
     }

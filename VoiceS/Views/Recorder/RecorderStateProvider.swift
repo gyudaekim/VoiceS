@@ -5,6 +5,9 @@ import Foundation
 @MainActor
 protocol RecorderStateProvider: AnyObject {
     var recordingState: RecordingState { get }
+    var backgroundState: BackgroundTranscriptionState { get }
     var partialTranscript: String { get }
+    var pendingTranscriptionCount: Int { get }
+    var isBackgroundProcessing: Bool { get }
     var enhancementService: AIEnhancementService? { get }
 }

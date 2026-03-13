@@ -4,7 +4,7 @@ import SwiftData
 import os
 
 /// Handles the full post-recording pipeline:
-/// transcribe → filter → format → word-replace → prompt-detect → AI enhance → save → paste → dismiss
+/// transcribe → filter → format → word-replace → prompt-detect → AI enhance → save → paste
 @MainActor
 class TranscriptionPipeline {
     private let modelContext: ModelContext
@@ -32,24 +32,26 @@ class TranscriptionPipeline {
     ///   - audioURL: The recorded audio file.
     ///   - model: The transcription model to use.
     ///   - session: An active streaming session if one was prepared, otherwise nil.
-    ///   - onStateChange: Called when the pipeline moves to a new recording state (e.g. `.enhancing`).
+    ///   - snapshot: Immutable per-recording settings captured when the job was enqueued.
+    ///   - onBackgroundStateChange: Called when the pipeline moves to a new background stage.
     ///   - shouldCancel: Returns true if the user requested cancellation.
     ///   - onCleanup: Called when cancellation is detected to release model resources.
-    ///   - onDismiss: Called at the end to dismiss the recorder panel.
     func run(
         transcription: Transcription,
         audioURL: URL,
         model: any TranscriptionModel,
         session: TranscriptionSession?,
-        onStateChange: @escaping (RecordingState) -> Void,
+        snapshot: TranscriptionJobSnapshot,
+        onBackgroundStateChange: @escaping (BackgroundTranscriptionState) -> Void,
         shouldCancel: () -> Bool,
-        onCleanup: @escaping () async -> Void,
-        onDismiss: @escaping () async -> Void
+        onCleanup: @escaping () async -> Void
     ) async {
         if shouldCancel() {
             await onCleanup()
             return
         }
+
+        onBackgroundStateChange(.transcribing)
 
         Task {
             let isSystemMuteEnabled = UserDefaults.standard.bool(forKey: "isSystemMuteEnabled")
@@ -77,16 +79,11 @@ class TranscriptionPipeline {
             logger.notice("📝 Output filter result: \(text, privacy: .public)")
             let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
 
-            let powerModeManager = PowerModeManager.shared
-            let activePowerModeConfig = powerModeManager.currentActiveConfiguration
-            let powerModeName = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.name : nil
-            let powerModeEmoji = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.emoji : nil
-
             if shouldCancel() { await onCleanup(); return }
 
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            if UserDefaults.standard.bool(forKey: "IsTextFormattingEnabled") {
+            if snapshot.isTextFormattingEnabled {
                 text = WhisperTextFormatter.format(text)
                 logger.notice("📝 Formatted transcript: \(text, privacy: .public)")
             }
@@ -101,26 +98,37 @@ class TranscriptionPipeline {
             transcription.duration = actualDuration
             transcription.transcriptionModelName = model.displayName
             transcription.transcriptionDuration = transcriptionDuration
-            transcription.powerModeName = powerModeName
-            transcription.powerModeEmoji = powerModeEmoji
+            transcription.powerModeName = snapshot.powerModeName
+            transcription.powerModeEmoji = snapshot.powerModeEmoji
             finalPastedText = text
 
-            if let enhancementService, enhancementService.isConfigured {
-                let detectionResult = await promptDetectionService.analyzeText(text, with: enhancementService)
+            if let enhancementService,
+               enhancementService.isConfigured,
+               let enhancementSnapshot = snapshot.enhancementContext {
+                let detectionResult = promptDetectionService.analyzeText(
+                    text,
+                    promptSnapshot: enhancementSnapshot
+                )
                 promptDetectionResult = detectionResult
-                await promptDetectionService.applyDetectionResult(detectionResult, to: enhancementService)
             }
 
             if let enhancementService,
-               enhancementService.isEnhancementEnabled,
-               enhancementService.isConfigured {
+               enhancementService.isConfigured,
+               let enhancementSnapshot = effectiveEnhancementSnapshot(
+                    from: snapshot.enhancementContext,
+                    detectionResult: promptDetectionResult
+               ),
+               enhancementSnapshot.isEnabled || promptDetectionResult?.shouldEnableAI == true {
                 if shouldCancel() { await onCleanup(); return }
 
-                onStateChange(.enhancing)
+                onBackgroundStateChange(.enhancing)
                 let textForAI = promptDetectionResult?.processedText ?? text
 
                 do {
-                    let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(textForAI)
+                    let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(
+                        textForAI,
+                        snapshot: enhancementSnapshot
+                    )
                     logger.notice("📝 AI enhancement: \(enhancedText, privacy: .public)")
                     transcription.enhancedText = enhancedText
                     transcription.aiEnhancementModelName = enhancementService.getAIService()?.currentModel
@@ -161,11 +169,9 @@ class TranscriptionPipeline {
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                let appendSpace = UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
-                CursorPaster.pasteAtCursor(textToPaste + (appendSpace ? " " : ""))
+                CursorPaster.pasteAtCursor(textToPaste + (snapshot.appendTrailingSpace ? " " : ""))
 
-                let powerMode = PowerModeManager.shared
-                if let activeConfig = powerMode.currentActiveConfiguration, activeConfig.isAutoSendEnabled {
+                if snapshot.shouldAutoSend {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                         CursorPaster.pressEnter()
                     }
@@ -173,12 +179,25 @@ class TranscriptionPipeline {
             }
         }
 
-        if let result = promptDetectionResult,
-           let enhancementService,
-           result.shouldEnableAI {
-            await promptDetectionService.restoreOriginalSettings(result, to: enhancementService)
-        }
+    }
 
-        await onDismiss()
+    private func effectiveEnhancementSnapshot(
+        from snapshot: EnhancementContextSnapshot?,
+        detectionResult: PromptDetectionService.PromptDetectionResult?
+    ) -> EnhancementContextSnapshot? {
+        guard let snapshot else { return nil }
+
+        let shouldEnableAI = snapshot.isEnabled || (detectionResult?.shouldEnableAI == true)
+        let selectedPromptId = detectionResult?.selectedPromptId ?? snapshot.selectedPromptId
+
+        return EnhancementContextSnapshot(
+            isEnabled: shouldEnableAI,
+            selectedPromptId: selectedPromptId,
+            prompts: snapshot.prompts,
+            useClipboardContext: snapshot.useClipboardContext,
+            useScreenCaptureContext: snapshot.useScreenCaptureContext,
+            capturedClipboardText: snapshot.capturedClipboardText,
+            capturedScreenText: snapshot.capturedScreenText
+        )
     }
 }

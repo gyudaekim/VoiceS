@@ -45,6 +45,38 @@ class PromptDetectionService {
             originalPromptId: originalPromptId
         )
     }
+
+    func analyzeText(
+        _ text: String,
+        promptSnapshot: EnhancementContextSnapshot?
+    ) -> PromptDetectionResult {
+        let prompts = promptSnapshot?.prompts ?? []
+        let originalEnhancementState = promptSnapshot?.isEnabled ?? false
+        let originalPromptId = promptSnapshot?.selectedPromptId
+
+        for prompt in prompts {
+            if !prompt.triggerWords.isEmpty,
+               let (detectedWord, processedText) = detectAndStripTriggerWord(from: text, triggerWords: prompt.triggerWords) {
+                return PromptDetectionResult(
+                    shouldEnableAI: true,
+                    selectedPromptId: prompt.id,
+                    processedText: processedText,
+                    detectedTriggerWord: detectedWord,
+                    originalEnhancementState: originalEnhancementState,
+                    originalPromptId: originalPromptId
+                )
+            }
+        }
+
+        return PromptDetectionResult(
+            shouldEnableAI: false,
+            selectedPromptId: nil,
+            processedText: text,
+            detectedTriggerWord: nil,
+            originalEnhancementState: originalEnhancementState,
+            originalPromptId: originalPromptId
+        )
+    }
     
     func applyDetectionResult(_ result: PromptDetectionResult, to enhancementService: AIEnhancementService) async {
         await MainActor.run {

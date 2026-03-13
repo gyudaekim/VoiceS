@@ -140,7 +140,27 @@ class AIEnhancementService: ObservableObject {
         lastRequestTime = Date()
     }
 
+    func makeSnapshot() -> EnhancementContextSnapshot {
+        EnhancementContextSnapshot(
+            isEnabled: isEnhancementEnabled,
+            selectedPromptId: selectedPromptId,
+            prompts: allPrompts,
+            useClipboardContext: useClipboardContext,
+            useScreenCaptureContext: useScreenCaptureContext,
+            capturedClipboardText: lastCapturedClipboard,
+            capturedScreenText: screenCaptureService.lastCapturedText
+        )
+    }
+
     private func getSystemMessage(for mode: EnhancementPrompt) async -> String {
+        let snapshot = makeSnapshot()
+        return await getSystemMessage(for: mode, snapshot: snapshot)
+    }
+
+    private func getSystemMessage(
+        for mode: EnhancementPrompt,
+        snapshot: EnhancementContextSnapshot?
+    ) async -> String {
         let selectedTextContext: String
         if AXIsProcessTrusted() {
             if let selectedText = await SelectedTextService.fetchSelectedText(), !selectedText.isEmpty {
@@ -152,16 +172,18 @@ class AIEnhancementService: ObservableObject {
             selectedTextContext = ""
         }
 
-        let clipboardContext = if useClipboardContext,
-                              let clipboardText = lastCapturedClipboard,
+        let clipboardContext = if let snapshot,
+                              snapshot.useClipboardContext,
+                              let clipboardText = snapshot.capturedClipboardText,
                               !clipboardText.isEmpty {
             "\n\n<CLIPBOARD_CONTEXT>\n\(clipboardText)\n</CLIPBOARD_CONTEXT>"
         } else {
             ""
         }
 
-        let screenCaptureContext = if useScreenCaptureContext,
-                                   let capturedText = screenCaptureService.lastCapturedText,
+        let screenCaptureContext = if let snapshot,
+                                   snapshot.useScreenCaptureContext,
+                                   let capturedText = snapshot.capturedScreenText,
                                    !capturedText.isEmpty {
             "\n\n<CURRENT_WINDOW_CONTEXT>\n\(capturedText)\n</CURRENT_WINDOW_CONTEXT>"
         } else {
@@ -187,19 +209,30 @@ class AIEnhancementService: ObservableObject {
 
         let finalContextSection = allContextSections + customVocabularySection
 
-        if let activePrompt = activePrompt {
+        let resolvedPrompt = resolvePrompt(from: snapshot)
+        if let activePrompt = resolvedPrompt {
             if activePrompt.id == PredefinedPrompts.assistantPromptId {
                 return activePrompt.promptText + finalContextSection
             } else {
                 return activePrompt.finalPromptText + finalContextSection
             }
         } else {
-            let defaultPrompt = allPrompts.first(where: { $0.id == PredefinedPrompts.defaultPromptId }) ?? allPrompts.first!
+            let promptSource = snapshot?.prompts ?? allPrompts
+            let defaultPrompt = promptSource.first(where: { $0.id == PredefinedPrompts.defaultPromptId }) ?? promptSource.first!
             return defaultPrompt.finalPromptText + finalContextSection
         }
     }
 
     private func makeRequest(text: String, mode: EnhancementPrompt) async throws -> String {
+        let snapshot = makeSnapshot()
+        return try await makeRequest(text: text, mode: mode, snapshot: snapshot)
+    }
+
+    private func makeRequest(
+        text: String,
+        mode: EnhancementPrompt,
+        snapshot: EnhancementContextSnapshot?
+    ) async throws -> String {
         guard isConfigured else {
             throw EnhancementError.notConfigured
         }
@@ -209,7 +242,7 @@ class AIEnhancementService: ObservableObject {
         }
 
         let formattedText = "\n<TRANSCRIPT>\n\(text)\n</TRANSCRIPT>"
-        let systemMessage = await getSystemMessage(for: mode)
+        let systemMessage = await getSystemMessage(for: mode, snapshot: snapshot)
 
         await MainActor.run {
             self.lastSystemMessageSent = systemMessage
@@ -287,12 +320,29 @@ class AIEnhancementService: ObservableObject {
     }
 
     private func makeRequestWithRetry(text: String, mode: EnhancementPrompt, maxRetries: Int = 3, initialDelay: TimeInterval = 1.0) async throws -> String {
+        let snapshot = makeSnapshot()
+        return try await makeRequestWithRetry(
+            text: text,
+            mode: mode,
+            snapshot: snapshot,
+            maxRetries: maxRetries,
+            initialDelay: initialDelay
+        )
+    }
+
+    private func makeRequestWithRetry(
+        text: String,
+        mode: EnhancementPrompt,
+        snapshot: EnhancementContextSnapshot?,
+        maxRetries: Int = 3,
+        initialDelay: TimeInterval = 1.0
+    ) async throws -> String {
         var retries = 0
         var currentDelay = initialDelay
 
         while retries < maxRetries {
             do {
-                return try await makeRequest(text: text, mode: mode)
+                return try await makeRequest(text: text, mode: mode, snapshot: snapshot)
             } catch let error as EnhancementError {
                 switch error {
                 case .networkError, .serverError, .rateLimitExceeded:
@@ -336,6 +386,25 @@ class AIEnhancementService: ObservableObject {
 
         do {
             let result = try await makeRequestWithRetry(text: text, mode: enhancementPrompt)
+            let endTime = Date()
+            let duration = endTime.timeIntervalSince(startTime)
+            return (result, duration, promptName)
+        } catch {
+            throw error
+        }
+    }
+
+    func enhance(_ text: String, snapshot: EnhancementContextSnapshot) async throws -> (String, TimeInterval, String?) {
+        let startTime = Date()
+        let enhancementPrompt: EnhancementPrompt = .transcriptionEnhancement
+        let promptName = resolvePrompt(from: snapshot)?.title
+
+        do {
+            let result = try await makeRequestWithRetry(
+                text: text,
+                mode: enhancementPrompt,
+                snapshot: snapshot
+            )
             let endTime = Date()
             let duration = endTime.timeIntervalSince(startTime)
             return (result, duration, promptName)
@@ -388,6 +457,20 @@ class AIEnhancementService: ObservableObject {
 
     func setActivePrompt(_ prompt: CustomPrompt) {
         selectedPromptId = prompt.id
+    }
+
+    private func resolvePrompt(from snapshot: EnhancementContextSnapshot?) -> CustomPrompt? {
+        guard let snapshot else {
+            return activePrompt
+        }
+
+        let promptSource = snapshot.prompts
+        if let selectedPromptId = snapshot.selectedPromptId,
+           let selectedPrompt = promptSource.first(where: { $0.id == selectedPromptId }) {
+            return selectedPrompt
+        }
+
+        return promptSource.first(where: { $0.id == PredefinedPrompts.defaultPromptId }) ?? promptSource.first
     }
 
     private func initializePredefinedPrompts() {

@@ -128,6 +128,10 @@ class TranscriptionModelManager: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "CurrentTranscriptionModel")
     }
 
+    func resolveModel(named name: String, provider: ModelProvider) -> (any TranscriptionModel)? {
+        allAvailableModels.first { $0.name == name && $0.provider == provider }
+    }
+
     // MARK: - Handle model deletion callback
 
     /// Called by WhisperModelManager.onModelDeleted or ParakeetModelManager.onModelDeleted.
