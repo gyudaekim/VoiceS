@@ -14,6 +14,7 @@ struct VoiceSApp: App {
     @StateObject private var engine: VoiceSEngine
     @StateObject private var whisperModelManager: WhisperModelManager
     @StateObject private var parakeetModelManager: ParakeetModelManager
+    @StateObject private var qwenModelManager: QwenModelManager
     @StateObject private var transcriptionModelManager: TranscriptionModelManager
     @StateObject private var recorderUIManager: RecorderUIManager
     @StateObject private var hotkeyManager: HotkeyManager
@@ -102,9 +103,11 @@ struct VoiceSApp: App {
         // 2. Create model managers
         let whisperModelManager = WhisperModelManager(modelsDirectory: modelsDirectory)
         let parakeetModelManager = ParakeetModelManager()
+        let qwenModelManager = QwenModelManager()
         let transcriptionModelManager = TranscriptionModelManager(
             whisperModelManager: whisperModelManager,
-            parakeetModelManager: parakeetModelManager
+            parakeetModelManager: parakeetModelManager,
+            qwenModelManager: qwenModelManager
         )
 
         // 3. Create UI manager
@@ -131,6 +134,7 @@ struct VoiceSApp: App {
 
         _whisperModelManager = StateObject(wrappedValue: whisperModelManager)
         _parakeetModelManager = StateObject(wrappedValue: parakeetModelManager)
+        _qwenModelManager = StateObject(wrappedValue: qwenModelManager)
         _transcriptionModelManager = StateObject(wrappedValue: transcriptionModelManager)
         _recorderUIManager = StateObject(wrappedValue: recorderUIManager)
         _engine = StateObject(wrappedValue: engine)
@@ -243,6 +247,7 @@ struct VoiceSApp: App {
                     .environmentObject(engine)
                     .environmentObject(whisperModelManager)
                     .environmentObject(parakeetModelManager)
+                    .environmentObject(qwenModelManager)
                     .environmentObject(transcriptionModelManager)
                     .environmentObject(recorderUIManager)
                     .environmentObject(hotkeyManager)
@@ -297,6 +302,7 @@ struct VoiceSApp: App {
                     .environmentObject(engine)
                     .environmentObject(whisperModelManager)
                     .environmentObject(parakeetModelManager)
+                    .environmentObject(qwenModelManager)
                     .environmentObject(transcriptionModelManager)
                     .environmentObject(recorderUIManager)
                     .environmentObject(aiService)
@@ -325,6 +331,7 @@ struct VoiceSApp: App {
                 .environmentObject(engine)
                 .environmentObject(whisperModelManager)
                 .environmentObject(parakeetModelManager)
+                .environmentObject(qwenModelManager)
                 .environmentObject(transcriptionModelManager)
                 .environmentObject(recorderUIManager)
                 .environmentObject(hotkeyManager)

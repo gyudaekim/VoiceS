@@ -9,12 +9,14 @@ class TranscriptionModelManager: ObservableObject {
 
     private weak var whisperModelManager: WhisperModelManager?
     private weak var parakeetModelManager: ParakeetModelManager?
+    private weak var qwenModelManager: QwenModelManager?
 
     private let logger = Logger(subsystem: "com.gdkim.voices", category: "TranscriptionModelManager")
 
-    init(whisperModelManager: WhisperModelManager, parakeetModelManager: ParakeetModelManager) {
+    init(whisperModelManager: WhisperModelManager, parakeetModelManager: ParakeetModelManager, qwenModelManager: QwenModelManager) {
         self.whisperModelManager = whisperModelManager
         self.parakeetModelManager = parakeetModelManager
+        self.qwenModelManager = qwenModelManager
 
         // Wire up deletion callbacks so each manager notifies this manager.
         whisperModelManager.onModelDeleted = { [weak self] modelName in
@@ -23,12 +25,18 @@ class TranscriptionModelManager: ObservableObject {
         parakeetModelManager.onModelDeleted = { [weak self] modelName in
             self?.handleModelDeleted(modelName)
         }
+        qwenModelManager.onModelDeleted = { [weak self] modelName in
+            self?.handleModelDeleted(modelName)
+        }
 
         // Wire up "models changed" callbacks so this manager rebuilds allAvailableModels.
         whisperModelManager.onModelsChanged = { [weak self] in
             self?.refreshAllAvailableModels()
         }
         parakeetModelManager.onModelsChanged = { [weak self] in
+            self?.refreshAllAvailableModels()
+        }
+        qwenModelManager.onModelsChanged = { [weak self] in
             self?.refreshAllAvailableModels()
         }
     }
@@ -42,6 +50,8 @@ class TranscriptionModelManager: ObservableObject {
                 return whisperModelManager?.availableModels.contains { $0.name == model.name } ?? false
             case .parakeet:
                 return parakeetModelManager?.isParakeetModelDownloaded(named: model.name) ?? false
+            case .qwen:
+                return qwenModelManager?.isQwenModelDownloaded(named: model.name) ?? false
             case .nativeApple:
                 if #available(macOS 26, *) {
                     return true

@@ -12,6 +12,7 @@ enum ModelProvider: String, Codable, Hashable, CaseIterable {
     case soniox = "Soniox"
     case custom = "Custom"
     case nativeApple = "Native Apple"
+    case qwen = "Qwen"
     // Future providers can be added here
 }
 
@@ -61,6 +62,24 @@ struct ParakeetModel: TranscriptionModel {
     let speed: Double
     let accuracy: Double
     let ramUsage: Double
+    var isMultilingualModel: Bool {
+        supportedLanguages.count > 1
+    }
+    let supportedLanguages: [String: String]
+}
+
+// A new struct for Qwen3-ASR models
+struct QwenModel: TranscriptionModel {
+    let id = UUID()
+    let name: String
+    let displayName: String
+    let description: String
+    let provider: ModelProvider = .qwen
+    let size: String
+    let speed: Double
+    let accuracy: Double
+    let ramUsage: Double
+    let modelId: String
     var isMultilingualModel: Bool {
         supportedLanguages.count > 1
     }

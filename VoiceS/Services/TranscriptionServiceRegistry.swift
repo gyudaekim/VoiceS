@@ -17,6 +17,7 @@ class TranscriptionServiceRegistry {
     private(set) lazy var cloudTranscriptionService = CloudTranscriptionService(modelContext: modelContext)
     private(set) lazy var nativeAppleTranscriptionService = NativeAppleTranscriptionService()
     private(set) lazy var parakeetTranscriptionService = ParakeetTranscriptionService()
+    private(set) lazy var qwenTranscriptionService = QwenTranscriptionService()
 
     init(modelProvider: any LocalModelProvider, modelsDirectory: URL, modelContext: ModelContext) {
         self.modelProvider = modelProvider
@@ -30,6 +31,8 @@ class TranscriptionServiceRegistry {
             return localTranscriptionService
         case .parakeet:
             return parakeetTranscriptionService
+        case .qwen:
+            return qwenTranscriptionService
         case .nativeApple:
             return nativeAppleTranscriptionService
         default:
@@ -89,5 +92,6 @@ class TranscriptionServiceRegistry {
 
     func cleanup() {
         parakeetTranscriptionService.cleanup()
+        qwenTranscriptionService.cleanup()
     }
 }

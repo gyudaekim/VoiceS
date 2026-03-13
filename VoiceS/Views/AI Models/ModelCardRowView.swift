@@ -4,6 +4,7 @@ import AppKit
 struct ModelCardRowView: View {
     let model: any TranscriptionModel
     let parakeetModelManager: ParakeetModelManager
+    let qwenModelManager: QwenModelManager
     let transcriptionModelManager: TranscriptionModelManager
     let isDownloaded: Bool
     let isCurrent: Bool
@@ -47,6 +48,14 @@ struct ModelCardRowView: View {
                     ParakeetModelCardRowView(
                         model: parakeetModel,
                         parakeetModelManager: parakeetModelManager,
+                        transcriptionModelManager: transcriptionModelManager
+                    )
+                }
+            case .qwen:
+                if let qwenModel = model as? QwenModel {
+                    QwenModelCardRowView(
+                        model: qwenModel,
+                        qwenModelManager: qwenModelManager,
                         transcriptionModelManager: transcriptionModelManager
                     )
                 }

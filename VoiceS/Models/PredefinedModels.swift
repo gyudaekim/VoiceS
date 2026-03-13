@@ -10,6 +10,15 @@ import Foundation
                 let appleSupportedCodes = ["ar", "de", "en", "es", "fr", "it", "ja", "ko", "pt", "yue", "zh"]
                 return allLanguages.filter { appleSupportedCodes.contains($0.key) }
             }
+            // For Qwen3-ASR, return supported languages
+            if provider == .qwen {
+                let qwenSupportedCodes = [
+                    "en", "zh", "yue", "ja", "ko", "fr", "de", "es", "pt", "ru",
+                    "ar", "th", "vi", "id", "ms", "tl", "tr", "pl", "uk", "nl",
+                    "sv", "it", "hu", "el", "cs", "ro", "da", "fi", "no", "hi"
+                ]
+                return allLanguages.filter { qwenSupportedCodes.contains($0.key) }
+            }
             // For Soniox, return only the 60 languages supported by stt-async-v4
             if provider == .soniox {
                 let sonioxSupportedCodes = [
@@ -121,6 +130,30 @@ import Foundation
             accuracy: 0.94,
             ramUsage: 0.8,
             supportedLanguages: getLanguageDictionary(isMultilingual: true, provider: .parakeet)
+        ),
+
+        // Qwen3-ASR Models
+        QwenModel(
+            name: "qwen3-asr-0.6b",
+            displayName: "Qwen3-ASR 0.6B",
+            description: "Alibaba's Qwen3-ASR 0.6B model running natively on Apple Silicon via MLX. Fast multilingual transcription with 30 language support",
+            size: "680 MB",
+            speed: 0.95,
+            accuracy: 0.93,
+            ramUsage: 2.2,
+            modelId: "aufklarer/Qwen3-ASR-0.6B-MLX-4bit",
+            supportedLanguages: getLanguageDictionary(isMultilingual: true, provider: .qwen)
+        ),
+        QwenModel(
+            name: "qwen3-asr-1.7b",
+            displayName: "Qwen3-ASR 1.7B",
+            description: "Alibaba's Qwen3-ASR 1.7B model running natively on Apple Silicon via MLX. Higher accuracy multilingual transcription",
+            size: "2.1 GB",
+            speed: 0.8,
+            accuracy: 0.96,
+            ramUsage: 4.5,
+            modelId: "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
+            supportedLanguages: getLanguageDictionary(isMultilingual: true, provider: .qwen)
         ),
 
          // Local Models
