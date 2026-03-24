@@ -547,3 +547,205 @@ Launch the app and verify the exact user complaint:
 - both UIs visible at once
 
 That is the remaining product question. The code builds and packages; the unresolved part is whether the runtime UX now matches what the user expects.
+
+---
+
+# Cloudflare Tunnel: External Access for Qwen ASR API
+
+## Goal
+
+Expose the Qwen3-ASR-1.7B server running on gdk-server (internal network) to the public internet via Cloudflare Tunnel, so VoiceS can use the custom transcription model without VPN.
+
+## Current Status: DONE (mostly)
+
+The tunnel is live and working. External access is confirmed.
+
+| Subdomain | Service | Port | Status |
+|-----------|---------|------|--------|
+| `mm.synrz.com` | Mattermost | 8065 | Working |
+| `asr.synrz.com` | Qwen ASR API | 8000 | Working |
+
+## Server Details
+
+- **Server IP**: `10.78.151.244` (Tailscale VPN / internal)
+- **OS**: Ubuntu 24.04.1 LTS
+- **SSH**: `ssh gdk@10.78.151.244` (ed25519 key, no SSH config file — connects by IP)
+- **GPU**: RTX 3080 Ti 12GB
+
+## What Was Done
+
+### 1. cloudflared installation
+
+`cloudflared` was already authenticated and a tunnel already existed when we started (the user had previously set up `mm.synrz.com` for Mattermost).
+
+- Binary installed at: `/home/gdk/cloudflared` (user download) AND `/usr/local/bin/cloudflared` (system copy)
+- Version: `2026.3.0`
+- Tunnel name: `magi-mattermost`
+- Tunnel UUID: `047854ae-4193-4aad-aed2-3cd42af745b4`
+
+### 2. Added ASR ingress rule
+
+Updated `~/.cloudflared/config.yml` and `/etc/cloudflared/config.yml`:
+
+```yaml
+tunnel: 047854ae-4193-4aad-aed2-3cd42af745b4
+credentials-file: /etc/cloudflared/047854ae-4193-4aad-aed2-3cd42af745b4.json
+
+ingress:
+  - hostname: mm.synrz.com
+    service: http://localhost:8065
+  - hostname: asr.synrz.com
+    service: http://localhost:8000
+  - service: http_status:404
+```
+
+### 3. DNS route added
+
+```bash
+~/cloudflared tunnel route dns magi-mattermost asr.synrz.com
+```
+
+This created a CNAME record in Cloudflare DNS pointing `asr.synrz.com` to the tunnel.
+
+### 4. systemd service registered
+
+Created `/etc/systemd/system/cloudflared.service`:
+
+```ini
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel run magi-mattermost
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enabled and started:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable cloudflared
+sudo systemctl start cloudflared
+```
+
+Status: `active (running)`, 4 QUIC connections to ICN (Seoul) edge.
+
+### 5. API key rotated
+
+Old key `qwen-asr-local` was replaced with a 64-char random hex string.
+
+- **New API key**: (see `~/qwen-asr-server/docker-compose.yml` on gdk-server → `API_KEY` env var)
+- Set in: `~/qwen-asr-server/docker-compose.yml` → `API_KEY` environment variable
+- The ASR container was recreated with `docker compose up -d`
+- Old key `qwen-asr-local` is now invalid
+
+The ASR server validates the key via `Authorization: Bearer <key>` header. See `~/qwen-asr-server/server.py` for the validation logic.
+
+## What Worked
+
+1. Installing cloudflared as a standalone binary (no sudo needed for download)
+2. Reusing the existing `magi-mattermost` tunnel — just added a new ingress rule
+3. `cloudflared tunnel route dns` for automatic CNAME creation
+4. systemd service for persistence across reboots
+5. API key rotation via docker-compose env var change + `docker compose up -d`
+
+## What Didn't Work / Issues Encountered
+
+1. **sudo password not available via SSH** — `sudo dpkg -i` failed because the SSH session can't prompt for passwords. Workaround: downloaded the binary directly to `~/cloudflared` instead of using the .deb package.
+
+2. **SSH session drops when killing cloudflared** — running `pkill -f 'cloudflared tunnel run'` in the same SSH command chain as other commands caused exit code 255. Workaround: split into separate SSH calls (kill first, then start service in next call).
+
+3. **nohup over SSH is unreliable** — `nohup ... &` over SSH sometimes causes the session to hang or return 255. Workaround: used single-quoted command (`'nohup ... &'`) which worked, then replaced with systemd for proper daemon management.
+
+4. **Pasting multi-line commands in Claude Code** — a long sudoers one-liner broke when pasted across lines. Workaround: simplified to a short single-line command.
+
+5. **Temporary NOPASSWD was needed for systemd setup** — added `gdk ALL=(ALL) NOPASSWD: ALL` to `/etc/sudoers.d/gdk-nopasswd`, then removed after setup was complete.
+
+## Remaining Work
+
+### 1. Update VoiceS app custom model settings
+
+The user needs to update VoiceS settings:
+
+- **API Endpoint**: `https://asr.synrz.com/v1/audio/transcriptions`
+- **API Key**: (see `~/qwen-asr-server/docker-compose.yml` on gdk-server)
+
+This is a manual step in the VoiceS macOS app UI (Settings → Custom Model).
+
+### 2. Verify transcription works end-to-end over the external endpoint
+
+After updating the app settings, test a real recording to confirm:
+
+- Audio is sent to `https://asr.synrz.com/...`
+- SSL/TLS works (Cloudflare handles this automatically)
+- API key authentication passes
+- Transcription result is returned correctly
+- Latency is acceptable (should be similar since Cloudflare edge is in Seoul/ICN)
+
+### 3. Consider Cloudflare Access (optional, deferred)
+
+The user decided API key is sufficient for now. If stronger security is needed later:
+
+- Cloudflare Zero Trust → Access → add an Application for `asr.synrz.com`
+- Service Token auth (adds `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers)
+- This would require VoiceS app to support custom headers beyond the standard `Authorization` header
+
+### 4. Keep config files in sync
+
+Two copies of `config.yml` exist:
+
+- `~/.cloudflared/config.yml` (user copy, used for `cloudflared tunnel` CLI commands)
+- `/etc/cloudflared/config.yml` (system copy, used by systemd service)
+
+If adding more ingress rules in the future, update BOTH files, then:
+
+```bash
+sudo systemctl restart cloudflared
+```
+
+### 5. Monitor tunnel health
+
+```bash
+# Check service status
+sudo systemctl status cloudflared
+
+# Check tunnel connections
+~/cloudflared tunnel info magi-mattermost
+
+# View recent logs
+journalctl -u cloudflared --since "1 hour ago" --no-pager
+```
+
+## Key Files on gdk-server
+
+| Path | Purpose |
+|------|---------|
+| `/home/gdk/cloudflared` | cloudflared binary (user copy) |
+| `/usr/local/bin/cloudflared` | cloudflared binary (system copy) |
+| `/home/gdk/.cloudflared/config.yml` | Tunnel config (user copy) |
+| `/home/gdk/.cloudflared/cert.pem` | Cloudflare auth certificate |
+| `/home/gdk/.cloudflared/047854ae-*.json` | Tunnel credentials |
+| `/etc/cloudflared/config.yml` | Tunnel config (systemd copy) |
+| `/etc/cloudflared/047854ae-*.json` | Tunnel credentials (systemd copy) |
+| `/etc/systemd/system/cloudflared.service` | systemd unit file |
+| `/home/gdk/qwen-asr-server/docker-compose.yml` | ASR server config (has API key) |
+| `/home/gdk/qwen-asr-server/server.py` | ASR server code (has auth logic) |
+
+## Docker Containers Running
+
+```
+qwen-asr-server        → :8000 (ASR API)
+mattermost-server-app  → :8065 (Mattermost)
+magi-control-plane     → :8080 (MAGI)
+reddit-crawler-app-1   → (no port exposed)
+reddit-crawler-db-1    → PostgreSQL (internal)
+mattermost-server-postgres → PostgreSQL (internal)
+mattermost-server-redis    → Redis (internal)
+```
