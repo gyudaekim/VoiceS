@@ -5,11 +5,40 @@ import os
 
 private let logger = Logger(subsystem: "com.VoiceS", category: "CursorPaster")
 
+enum PasteResult {
+    case succeeded
+    case clipboardWriteFailed
+    case accessibilityDenied
+    case inputSourceUnavailable
+    case appleScriptFailed(String)
+}
+
 class CursorPaster {
 
-    static func pasteAtCursor(_ text: String) {
+    // Minimum delay before restoring the user's prior clipboard contents.
+    // The target app needs enough time to receive Cmd+V AND actually read the
+    // pasteboard. Electron / web-based apps (Notion, Slack, VS Code, Discord)
+    // and slow web text fields routinely take more than 300-500ms, so 250ms
+    // was far too aggressive and caused "previous clipboard gets pasted" bug.
+    private static let minimumRestoreDelay: TimeInterval = 1.2
+
+    // Tracks the most recent in-flight clipboard restoration work so a
+    // subsequent paste can flush/cancel it before starting its own cycle.
+    private static var pendingRestoreWorkItem: DispatchWorkItem?
+
+    @discardableResult
+    static func pasteAtCursor(_ text: String) -> PasteResult {
         let pasteboard = NSPasteboard.general
         let shouldRestoreClipboard = UserDefaults.standard.bool(forKey: "restoreClipboardAfterPaste")
+
+        // If a previous paste still has a pending restore scheduled, run it
+        // synchronously now so we don't save "the previous transcript" as the
+        // "original clipboard" of this paste.
+        if let pending = pendingRestoreWorkItem {
+            pending.cancel()
+            pending.perform()
+            pendingRestoreWorkItem = nil
+        }
 
         var savedContents: [(NSPasteboard.PasteboardType, Data)] = []
 
@@ -25,29 +54,42 @@ class CursorPaster {
             }
         }
 
-        ClipboardManager.setClipboard(text, transient: shouldRestoreClipboard)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if UserDefaults.standard.bool(forKey: "useAppleScriptPaste") {
-                pasteUsingAppleScript()
-            } else {
-                pasteFromClipboard()
-            }
+        // Verify the clipboard write actually committed before we synthesize
+        // Cmd+V. Without this, a silent setString failure causes whatever was
+        // in the clipboard before (the user's previously copied item) to be
+        // pasted instead of the transcription.
+        let writeSucceeded = ClipboardManager.setClipboard(text, transient: shouldRestoreClipboard)
+        if !writeSucceeded {
+            logger.error("Failed to write transcription to clipboard — skipping paste to avoid pasting stale clipboard contents")
+            return .clipboardWriteFailed
         }
 
-        if shouldRestoreClipboard {
-            let restoreDelay = UserDefaults.standard.double(forKey: "clipboardRestoreDelay")
-            let delay = max(restoreDelay, 0.25)
+        let useAppleScript = UserDefaults.standard.bool(forKey: "useAppleScriptPaste")
+        let pasteResult: PasteResult
+        if useAppleScript {
+            pasteResult = pasteUsingAppleScript()
+        } else {
+            pasteResult = pasteFromClipboard()
+        }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                if !savedContents.isEmpty {
-                    pasteboard.clearContents()
-                    for (type, data) in savedContents {
-                        pasteboard.setData(data, forType: type)
-                    }
+        // Only schedule restoration if we actually dispatched a paste, and
+        // give the target app plenty of time to consume the pasteboard.
+        if shouldRestoreClipboard, case .succeeded = pasteResult, !savedContents.isEmpty {
+            let userPref = UserDefaults.standard.double(forKey: "clipboardRestoreDelay")
+            let delay = max(userPref, minimumRestoreDelay)
+
+            let workItem = DispatchWorkItem {
+                pasteboard.clearContents()
+                for (type, data) in savedContents {
+                    pasteboard.setData(data, forType: type)
                 }
+                pendingRestoreWorkItem = nil
             }
+            pendingRestoreWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         }
+
+        return pasteResult
     }
 
     // MARK: - AppleScript paste
@@ -65,26 +107,29 @@ class CursorPaster {
     }()
 
     // Paste via AppleScript. Works with custom keyboard layouts (e.g. Neo2) where CGEvent-based paste fails.
-    private static func pasteUsingAppleScript() {
+    private static func pasteUsingAppleScript() -> PasteResult {
         var error: NSDictionary?
         pasteScript?.executeAndReturnError(&error)
         if let error = error {
             logger.error("AppleScript paste failed: \(error, privacy: .public)")
+            let message = (error["NSAppleScriptErrorMessage"] as? String) ?? "Unknown AppleScript error"
+            return .appleScriptFailed(message)
         }
+        return .succeeded
     }
 
     // MARK: - CGEvent paste
 
     // Paste via CGEvent, temporarily switching to a QWERTY input source so virtual key 0x09 maps to "V".
-    private static func pasteFromClipboard() {
+    private static func pasteFromClipboard() -> PasteResult {
         guard AXIsProcessTrusted() else {
             logger.error("Accessibility not trusted — cannot paste")
-            return
+            return .accessibilityDenied
         }
 
         guard let currentSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
             logger.error("TISCopyCurrentKeyboardInputSource returned nil")
-            return
+            return .inputSourceUnavailable
         }
         let currentID = sourceID(for: currentSource) ?? "unknown"
         let switched = switchToQWERTYInputSource()
@@ -121,6 +166,12 @@ class CursorPaster {
                 }
             }
         }
+
+        // We consider the paste dispatched successfully once we have scheduled
+        // the Cmd+V CGEvents. Actual delivery to the target app is async and
+        // can't be observed from here, but we've cleared the synchronous
+        // failure modes (accessibility, input source lookup).
+        return .succeeded
     }
 
     // Try to switch to ABC or US QWERTY. Returns true if the switch was made.

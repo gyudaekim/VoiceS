@@ -414,20 +414,10 @@ class VoiceSEngine: NSObject, ObservableObject {
     func setupNotifications() {
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(handleLicenseStatusChanged),
-            name: .licenseStatusChanged,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
             selector: #selector(handlePromptChange),
             name: .promptDidChange,
             object: nil
         )
-    }
-
-    @objc func handleLicenseStatusChanged() {
-        pipeline.licenseViewModel = LicenseViewModel()
     }
 
     @objc func handlePromptChange() {

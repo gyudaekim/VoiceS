@@ -7,10 +7,12 @@ struct ClipboardManager {
         case accessDenied
     }
 
+    @discardableResult
     static func setClipboard(_ text: String, transient: Bool = false) -> Bool {
         let pasteboard = NSPasteboard.general
+        let beforeChangeCount = pasteboard.changeCount
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        let didWriteString = pasteboard.setString(text, forType: .string)
 
         if let bundleIdentifier = Bundle.main.bundleIdentifier {
             pasteboard.setString(bundleIdentifier, forType: NSPasteboard.PasteboardType("org.nspasteboard.source"))
@@ -20,9 +22,24 @@ struct ClipboardManager {
             pasteboard.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
         }
 
+        // The pasteboard server bumps changeCount on every successful write.
+        // If it did not move, the write did not land in the system pasteboard
+        // and a follow-up Cmd+V would paste whatever was there before.
+        let didBumpChangeCount = pasteboard.changeCount > beforeChangeCount
+        guard didWriteString && didBumpChangeCount else {
+            return false
+        }
+
+        // Verify the string we just wrote is actually readable back.
+        // This catches cases where another app is holding/racing the pasteboard.
+        if pasteboard.string(forType: .string) != text {
+            return false
+        }
+
         return true
     }
 
+    @discardableResult
     static func copyToClipboard(_ text: String) -> Bool {
         return setClipboard(text, transient: false)
     }
