@@ -5,7 +5,6 @@ import os
 struct MetricsContent: View {
     private let logger = Logger(subsystem: "com.gdkim.VoiceS", category: "MetricsContent")
     let modelContext: ModelContext
-    let licenseState: LicenseViewModel.LicenseState
 
     @State private var totalCount: Int = 0
     @State private var totalWords: Int = 0
@@ -26,10 +25,6 @@ struct MetricsContent: View {
                         VStack(spacing: 24) {
                             heroSection
                             metricsSection
-                            HStack(alignment: .top, spacing: 18) {
-                                HelpAndResourcesSection()
-                                DashboardPromotionsSection(licenseState: licenseState)
-                            }
 
                             Spacer(minLength: 20)
 
