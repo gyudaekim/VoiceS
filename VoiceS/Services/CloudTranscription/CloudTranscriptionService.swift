@@ -145,7 +145,9 @@ class CloudTranscriptionService: TranscriptionService {
     }
 
     private func selectedLanguage() -> String? {
-        let lang = UserDefaults.standard.string(forKey: "SelectedLanguage") ?? "auto"
+        let lang = LanguageHintOverride.current
+            ?? UserDefaults.standard.string(forKey: "SelectedLanguage")
+            ?? "auto"
         return (lang == "auto" || lang.isEmpty) ? nil : lang
     }
 

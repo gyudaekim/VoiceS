@@ -34,8 +34,11 @@ actor WhisperContext {
         let maxThreads = max(1, min(8, cpuCount() - 2))
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
         
-        // Read language directly from UserDefaults
-        let selectedLanguage = UserDefaults.standard.string(forKey: "SelectedLanguage") ?? "auto"
+        // Prefer the per-call language hint (set by the Transcribe Audio tab's long-audio flow);
+        // fall back to the global UserDefaults setting used by the live-recording path.
+        let selectedLanguage = LanguageHintOverride.current
+            ?? UserDefaults.standard.string(forKey: "SelectedLanguage")
+            ?? "auto"
         if selectedLanguage != "auto" {
             languageCString = Array(selectedLanguage.utf8CString)
             params.language = languageCString?.withUnsafeBufferPointer { ptr in

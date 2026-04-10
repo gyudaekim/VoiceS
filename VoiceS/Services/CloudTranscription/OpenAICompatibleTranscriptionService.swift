@@ -51,7 +51,9 @@ class OpenAICompatibleTranscriptionService {
             throw CloudTranscriptionError.audioFileNotFound
         }
         
-        let selectedLanguage = UserDefaults.standard.string(forKey: "SelectedLanguage") ?? "auto"
+        let selectedLanguage = LanguageHintOverride.current
+            ?? UserDefaults.standard.string(forKey: "SelectedLanguage")
+            ?? "auto"
         let prompt = UserDefaults.standard.string(forKey: "TranscriptionPrompt") ?? ""
         
         body.append("--\(boundary)\(crlf)".data(using: .utf8)!)

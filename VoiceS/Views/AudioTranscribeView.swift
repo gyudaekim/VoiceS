@@ -13,6 +13,19 @@ struct AudioTranscribeView: View {
     @State private var isAudioFileSelected = false
     @State private var isEnhancementEnabled = false
     @State private var selectedPromptId: UUID?
+    @AppStorage("TranscribeAudioLanguage") private var selectedLanguage: String = "auto"
+
+    // Ordered language hints matching the gdk-server Qwen ASR web UI dropdown.
+    private let languageOptions: [(code: String, label: String)] = [
+        ("auto", "Auto-detect"),
+        ("en", "English"),
+        ("ko", "Korean"),
+        ("ja", "Japanese"),
+        ("zh", "Chinese"),
+        ("es", "Spanish"),
+        ("fr", "French"),
+        ("de", "German")
+    ]
     
     var body: some View {
         ZStack {
@@ -31,7 +44,21 @@ struct AudioTranscribeView: View {
                 
                 // Show current transcription result
                 if let transcription = transcriptionManager.currentTranscription {
-                    TranscriptionResultView(transcription: transcription)
+                    VStack(alignment: .leading, spacing: 8) {
+                        TranscriptionResultView(transcription: transcription)
+
+                        if let markdown = transcriptionManager.currentTranscriptionMarkdown, !markdown.isEmpty {
+                            HStack {
+                                Spacer()
+                                MarkdownDownloadButton(
+                                    markdown: markdown,
+                                    sourceFileName: URL(string: transcription.audioFileURL ?? "")?.lastPathComponent
+                                )
+                            }
+                            .padding(.horizontal)
+                            .padding(.bottom, 8)
+                        }
+                    }
                 }
             }
         }
@@ -123,6 +150,23 @@ struct AudioTranscribeView: View {
                             selectedPromptId = enhancementService.selectedPromptId
                         }
 
+                    // Language hint picker — overrides the global SelectedLanguage for this run only.
+                    HStack(spacing: 8) {
+                        Text("Language:")
+                            .font(.subheadline)
+                        Picker("", selection: $selectedLanguage) {
+                            ForEach(languageOptions, id: \.code) { option in
+                                Text(option.label).tag(option.code)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(CardBackground(isSelected: false))
+
                     // Action Buttons in a row
                     HStack(spacing: 12) {
                         Button("Start Transcription") {
@@ -130,12 +174,13 @@ struct AudioTranscribeView: View {
                                 transcriptionManager.startProcessing(
                                     url: url,
                                     modelContext: modelContext,
-                                    engine: engine
+                                    engine: engine,
+                                    languageHint: selectedLanguage
                                 )
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        
+
                         Button("Choose Different File") {
                             selectedAudioURL = nil
                             isAudioFileSelected = false
@@ -189,12 +234,55 @@ struct AudioTranscribeView: View {
     }
     
     private var processingView: some View {
-        VStack(spacing: 16) {
-            ProgressView()
-                .scaleEffect(0.8)
-            Text(transcriptionManager.processingPhase.message)
+        let progress = transcriptionManager.longAudioProgress
+        let phaseMessage = transcriptionManager.processingPhase.message
+
+        return VStack(alignment: .leading, spacing: 16) {
+            Text(phaseMessage.isEmpty ? "Working…" : phaseMessage)
                 .font(.headline)
+
+            if let percent = progress.progressPercent {
+                ProgressView(value: percent, total: 100)
+                    .progressViewStyle(.linear)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+
+            HStack(spacing: 12) {
+                if let chunkLabel = progress.chunkLabel {
+                    Label("Chunk \(chunkLabel)", systemImage: "square.grid.2x2")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                if let percent = progress.progressPercent {
+                    Text(String(format: "%.0f%%", percent))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                if let language = progress.detectedLanguage, !language.isEmpty {
+                    Label(language, systemImage: "globe")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Cancel") {
+                    transcriptionManager.cancelProcessing()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if !progress.message.isEmpty {
+                Text(progress.message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
         }
+        .padding(20)
+        .frame(maxWidth: 560)
+        .background(CardBackground(isSelected: false))
         .padding()
     }
     
@@ -293,5 +381,62 @@ struct AudioTranscribeView: View {
         let minutes = Int(duration) / 60
         let seconds = Int(duration) % 60
         return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+/// Writes the raw Markdown produced by the long-audio transcription flow to a user-chosen
+/// file. Separate from `AnimatedSaveButton` because that one re-wraps plain text in a
+/// `# Transcription` header; long-audio Markdown already has its own header from either
+/// the server or `ClientChunkingStrategy.buildMarkdown`.
+private struct MarkdownDownloadButton: View {
+    let markdown: String
+    let sourceFileName: String?
+
+    @State private var isSaved: Bool = false
+
+    var body: some View {
+        Button(action: save) {
+            HStack(spacing: 6) {
+                Image(systemName: isSaved ? "checkmark" : "arrow.down.doc")
+                Text(isSaved ? "Downloaded" : "Download Markdown")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(isSaved ? Color.green.opacity(0.85) : Color.accentColor)
+            )
+            .foregroundColor(.white)
+        }
+        .buttonStyle(.plain)
+        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isSaved)
+    }
+
+    private func save() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.text]
+        panel.nameFieldStringValue = "\(defaultFileName()).md"
+        panel.title = "Save Transcription"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            withAnimation { isSaved = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                withAnimation { isSaved = false }
+            }
+        } catch {
+            NSSound.beep()
+        }
+    }
+
+    private func defaultFileName() -> String {
+        if let source = sourceFileName, !source.isEmpty {
+            let stem = (source as NSString).deletingPathExtension
+            if !stem.isEmpty { return stem }
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmm"
+        return "transcription-\(formatter.string(from: Date()))"
     }
 }
