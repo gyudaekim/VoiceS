@@ -4,18 +4,28 @@ import AVFoundation
 import SwiftData
 import os
 
+struct FileTranscriptionJob {
+    let id: UUID
+    let permanentURL: URL
+    let transcription: Transcription
+    let languageHint: String
+    let isEnhancementEnabled: Bool
+    let selectedPromptId: UUID?
+}
+
 @MainActor
 class AudioTranscriptionManager: ObservableObject {
     static let shared = AudioTranscriptionManager()
 
     @Published var isProcessing = false
     @Published var processingPhase: ProcessingPhase = .idle
-    @Published var currentTranscription: Transcription?
-    @Published var currentTranscriptionMarkdown: String?
     @Published var longAudioProgress: LongAudioProgress = .idle
     @Published var errorMessage: String?
+    @Published var queue: [FileTranscriptionJob] = []
+    @Published var currentJob: FileTranscriptionJob?
 
     private var currentTask: Task<Void, Error>?
+    private var isProcessingQueue = false
     private let audioProcessor = AudioProcessor()
     private let logger = Logger(subsystem: "com.gdkim.voices", category: "AudioTranscriptionManager")
 
@@ -34,7 +44,7 @@ class AudioTranscriptionManager: ObservableObject {
             case .loading:
                 return "Loading transcription model..."
             case .processingAudio:
-                return "Processing audio file for transcription..."
+                return "Processing audio file..."
             case .transcribing:
                 return "Transcribing audio..."
             case .enhancing:
@@ -47,270 +57,337 @@ class AudioTranscriptionManager: ObservableObject {
 
     private init() {}
 
+    // MARK: - Public API
+
+    func enqueueFiles(
+        urls: [URL],
+        modelContext: ModelContext,
+        engine: VoiceSEngine,
+        languageHint: String = "auto",
+        isEnhancementEnabled: Bool = false,
+        selectedPromptId: UUID? = nil
+    ) {
+        let recordingsDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.gdkim.VoiceS")
+            .appendingPathComponent("Recordings")
+        try? FileManager.default.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
+
+        for url in urls {
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
+            let originalFileName = url.lastPathComponent
+
+            // Copy file to permanent location
+            let ext = url.pathExtension.isEmpty ? "wav" : url.pathExtension
+            let permanentURL = recordingsDirectory
+                .appendingPathComponent("transcribed_\(UUID().uuidString).\(ext)")
+            do {
+                try FileManager.default.copyItem(at: url, to: permanentURL)
+            } catch {
+                logger.error("Failed to copy file \(originalFileName, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                continue
+            }
+
+            // Get duration
+            let duration: TimeInterval
+            if let d = try? AVURLAsset(url: permanentURL).duration {
+                duration = CMTimeGetSeconds(d)
+            } else {
+                duration = 0
+            }
+
+            // Create Transcription record immediately
+            let transcription = Transcription(
+                text: "",
+                duration: duration,
+                audioFileURL: permanentURL.absoluteString,
+                source: "file",
+                originalFileName: originalFileName,
+                transcriptionStatus: .queued
+            )
+            modelContext.insert(transcription)
+
+            let job = FileTranscriptionJob(
+                id: UUID(),
+                permanentURL: permanentURL,
+                transcription: transcription,
+                languageHint: languageHint,
+                isEnhancementEnabled: isEnhancementEnabled,
+                selectedPromptId: selectedPromptId
+            )
+            queue.append(job)
+        }
+
+        do { try modelContext.save() } catch {
+            logger.error("Failed to save queued transcriptions: \(error.localizedDescription, privacy: .public)")
+        }
+
+        if !isProcessingQueue {
+            processQueue(modelContext: modelContext, engine: engine)
+        }
+    }
+
+    /// Backward-compatible single-file entry point.
     func startProcessing(
         url: URL,
         modelContext: ModelContext,
         engine: VoiceSEngine,
-        languageHint: String = "auto"
+        languageHint: String = "auto",
+        isEnhancementEnabled: Bool = false,
+        selectedPromptId: UUID? = nil
     ) {
-        // Cancel any existing processing
-        cancelProcessing()
-
-        isProcessing = true
-        processingPhase = .loading
-        longAudioProgress = .idle
-        currentTranscriptionMarkdown = nil
-        errorMessage = nil
-
-        currentTask = Task {
-            // Re-acquire security-scoped access for the file URL — the original scope
-            // from validateAndSetAudioFile was released in its defer block before this Task runs.
-            let accessing = url.startAccessingSecurityScopedResource()
-            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-
-            do {
-                guard let currentModel = engine.transcriptionModelManager.currentTranscriptionModel else {
-                    throw TranscriptionError.noModelSelected
-                }
-
-                let serviceRegistry = TranscriptionServiceRegistry(
-                    modelProvider: engine.whisperModelManager,
-                    modelsDirectory: engine.whisperModelManager.modelsDirectory,
-                    modelContext: modelContext
-                )
-                defer {
-                    serviceRegistry.cleanup()
-                }
-
-                processingPhase = .processingAudio
-
-                let audioAsset = AVURLAsset(url: url)
-                let duration = CMTimeGetSeconds(try await audioAsset.load(.duration))
-
-                // Decide strategy early so we know whether to keep the original file as-is
-                // (server path) or pre-convert to 16 kHz mono WAV (client chunking path).
-                //
-                // First check if the current model is a CustomCloudModel. If not (e.g., a
-                // predefined QwenModel won the name-collision in allAvailableModels), scan
-                // CustomModelManager for any registered model whose endpoint matches the
-                // async job pattern. This lets the server path activate even when the user
-                // selects the predefined local model name.
-                let serverCustomModel: CustomCloudModel?
-                let serverBaseURL: URL?
-                if let custom = currentModel as? CustomCloudModel,
-                   let base = QwenServerJobStrategy.deriveBaseURL(from: custom.apiEndpoint) {
-                    serverCustomModel = custom
-                    serverBaseURL = base
-                    logger.info("Derived server base URL: \(base.absoluteString, privacy: .public) from selected CustomCloudModel endpoint: \(custom.apiEndpoint, privacy: .public)")
-                } else if let fallbackCustom = CustomModelManager.shared.customModels.first(where: {
-                    QwenServerJobStrategy.deriveBaseURL(from: $0.apiEndpoint) != nil
-                }) {
-                    serverCustomModel = fallbackCustom
-                    serverBaseURL = QwenServerJobStrategy.deriveBaseURL(from: fallbackCustom.apiEndpoint)
-                    logger.info("Selected model \(currentModel.displayName, privacy: .public) is not a CustomCloudModel, but found server-compatible CustomCloudModel '\(fallbackCustom.displayName, privacy: .public)' at \(fallbackCustom.apiEndpoint, privacy: .public)")
-                } else {
-                    serverCustomModel = nil
-                    serverBaseURL = nil
-                    logger.info("No server-compatible CustomCloudModel found — will use client chunking for \(currentModel.displayName, privacy: .public)")
-                }
-
-                // Prepare permanent audio file for SwiftData Transcription.audioFileURL
-                let recordingsDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("com.gdkim.VoiceS")
-                    .appendingPathComponent("Recordings")
-                try FileManager.default.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
-
-                let permanentURL: URL
-                if serverBaseURL != nil {
-                    // Copy original file verbatim — uploading an MP3/M4A is far smaller than a 16 kHz WAV,
-                    // and the server re-normalizes via ffmpeg anyway.
-                    let ext = url.pathExtension.isEmpty ? "wav" : url.pathExtension
-                    permanentURL = recordingsDirectory
-                        .appendingPathComponent("transcribed_\(UUID().uuidString).\(ext)")
-                    try FileManager.default.copyItem(at: url, to: permanentURL)
-                } else {
-                    // Client chunking: convert once up front (matches legacy behavior). This keeps the
-                    // chunking strategy's later `processAudioToSamples` cheap since the file is already
-                    // 16 kHz mono PCM.
-                    let samples = try await audioProcessor.processAudioToSamples(url)
-                    permanentURL = recordingsDirectory
-                        .appendingPathComponent("transcribed_\(UUID().uuidString).wav")
-                    try audioProcessor.saveSamplesAsWav(samples: samples, to: permanentURL)
-                }
-
-                try Task.checkCancellation()
-
-                // Build the strategy
-                let strategy: LongAudioTranscriptionStrategy
-                if let baseURL = serverBaseURL, let custom = serverCustomModel {
-                    strategy = QwenServerJobStrategy(baseURL: baseURL, apiKey: custom.apiKey)
-                    logger.info("Using QwenServerJobStrategy @ \(baseURL.absoluteString, privacy: .public)")
-                } else {
-                    strategy = ClientChunkingStrategy(
-                        serviceRegistry: serviceRegistry,
-                        model: currentModel,
-                        audioProcessor: audioProcessor
-                    )
-                    logger.info("Using ClientChunkingStrategy for \(currentModel.displayName, privacy: .public)")
-                }
-
-                processingPhase = .transcribing
-                let transcriptionStart = Date()
-
-                let progressCallback: (LongAudioProgress) -> Void = { [weak self] progress in
-                    self?.longAudioProgress = progress
-                }
-
-                let result: LongAudioResult
-                do {
-                    result = try await strategy.transcribe(
-                        audioURL: permanentURL,
-                        languageHint: languageHint,
-                        progress: progressCallback
-                    )
-                } catch LongAudioTranscriptionError.asyncJobsNotSupported {
-                    // Server doesn't support the async job API (e.g., it's a generic
-                    // OpenAI-compatible endpoint, not the gdk-server Qwen ASR). Fall back
-                    // to client-side chunking.
-                    logger.info("Server doesn't support async jobs — falling back to client chunking")
-                    let fallbackStrategy = ClientChunkingStrategy(
-                        serviceRegistry: serviceRegistry,
-                        model: currentModel,
-                        audioProcessor: audioProcessor
-                    )
-                    result = try await fallbackStrategy.transcribe(
-                        audioURL: permanentURL,
-                        languageHint: languageHint,
-                        progress: progressCallback
-                    )
-                } catch is CancellationError {
-                    throw TranscriptionError.transcriptionCancelled
-                }
-
-                let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
-
-                var text = TranscriptionOutputFilter.filter(result.text)
-                text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                let powerModeManager = PowerModeManager.shared
-                let activePowerModeConfig = powerModeManager.currentActiveConfiguration
-                let powerModeName = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.name : nil
-                let powerModeEmoji = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.emoji : nil
-
-                if UserDefaults.standard.bool(forKey: "IsTextFormattingEnabled") {
-                    text = WhisperTextFormatter.format(text)
-                }
-
-                text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
-
-                // Cache the Markdown for the download button while the result is on screen.
-                currentTranscriptionMarkdown = result.markdown
-
-                // Handle enhancement if enabled
-                if let enhancementService = engine.enhancementService,
-                   enhancementService.isEnhancementEnabled,
-                   enhancementService.isConfigured {
-                    processingPhase = .enhancing
-                    do {
-                        let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(text)
-                        let transcription = Transcription(
-                            text: text,
-                            duration: duration,
-                            enhancedText: enhancedText,
-                            audioFileURL: permanentURL.absoluteString,
-                            transcriptionModelName: currentModel.displayName,
-                            aiEnhancementModelName: enhancementService.getAIService()?.currentModel,
-                            promptName: promptName,
-                            transcriptionDuration: transcriptionDuration,
-                            enhancementDuration: enhancementDuration,
-                            aiRequestSystemMessage: enhancementService.lastSystemMessageSent,
-                            aiRequestUserMessage: enhancementService.lastUserMessageSent,
-                            powerModeName: powerModeName,
-                            powerModeEmoji: powerModeEmoji,
-                            source: "file",
-                            originalFileName: url.lastPathComponent,
-                            transcriptionStatus: .completed
-                        )
-                        modelContext.insert(transcription)
-                        try modelContext.save()
-                        NotificationCenter.default.post(name: .transcriptionCreated, object: transcription)
-                        NotificationCenter.default.post(name: .transcriptionCompleted, object: transcription)
-                        currentTranscription = transcription
-                    } catch {
-                        logger.error("❌ Enhancement failed: \(error.localizedDescription, privacy: .public)")
-                        let transcription = Transcription(
-                            text: text,
-                            duration: duration,
-                            audioFileURL: permanentURL.absoluteString,
-                            transcriptionModelName: currentModel.displayName,
-                            promptName: nil,
-                            transcriptionDuration: transcriptionDuration,
-                            powerModeName: powerModeName,
-                            powerModeEmoji: powerModeEmoji,
-                            source: "file",
-                            originalFileName: url.lastPathComponent,
-                            transcriptionStatus: .completed
-                        )
-                        modelContext.insert(transcription)
-                        try modelContext.save()
-                        NotificationCenter.default.post(name: .transcriptionCreated, object: transcription)
-                        NotificationCenter.default.post(name: .transcriptionCompleted, object: transcription)
-                        currentTranscription = transcription
-                    }
-                } else {
-                    let transcription = Transcription(
-                        text: text,
-                        duration: duration,
-                        audioFileURL: permanentURL.absoluteString,
-                        transcriptionModelName: currentModel.displayName,
-                        promptName: nil,
-                        transcriptionDuration: transcriptionDuration,
-                        powerModeName: powerModeName,
-                        powerModeEmoji: powerModeEmoji,
-                        source: "file",
-                        originalFileName: url.lastPathComponent,
-                        transcriptionStatus: .completed
-                    )
-                    modelContext.insert(transcription)
-                    try modelContext.save()
-                    NotificationCenter.default.post(name: .transcriptionCreated, object: transcription)
-                    NotificationCenter.default.post(name: .transcriptionCompleted, object: transcription)
-                    currentTranscription = transcription
-                }
-
-                processingPhase = .completed
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                await finishProcessing()
-
-            } catch {
-                await handleError(error)
-            }
-        }
+        enqueueFiles(
+            urls: [url],
+            modelContext: modelContext,
+            engine: engine,
+            languageHint: languageHint,
+            isEnhancementEnabled: isEnhancementEnabled,
+            selectedPromptId: selectedPromptId
+        )
     }
 
     func cancelProcessing() {
         currentTask?.cancel()
-    }
-
-    private func finishProcessing() {
-        isProcessing = false
-        processingPhase = .idle
-        longAudioProgress = .idle
         currentTask = nil
-    }
 
-    private func handleError(_ error: Error) {
-        if error is CancellationError || (error as? TranscriptionError) == .transcriptionCancelled {
-            logger.info("Transcription cancelled")
-        } else {
-            logger.error("❌ Transcription error: \(error.localizedDescription, privacy: .public)")
-            errorMessage = error.localizedDescription
+        // Mark all queued items as failed
+        for job in queue {
+            job.transcription.transcriptionStatus = TranscriptionStatus.failed.rawValue
         }
+        queue.removeAll()
+        currentJob = nil
+        isProcessingQueue = false
         isProcessing = false
         processingPhase = .idle
         longAudioProgress = .idle
-        currentTranscriptionMarkdown = nil
-        currentTask = nil
+        errorMessage = nil
+    }
+
+    /// Mark stale queued/in-progress file transcriptions as failed (e.g., after app crash).
+    func cleanupStaleJobs(modelContext: ModelContext) {
+        let queuedRaw = TranscriptionStatus.queued.rawValue
+        let inProgressRaw = TranscriptionStatus.inProgress.rawValue
+        var descriptor = FetchDescriptor<Transcription>(
+            predicate: #Predicate<Transcription> { t in
+                t.source == "file" &&
+                (t.transcriptionStatus == queuedRaw || t.transcriptionStatus == inProgressRaw)
+            }
+        )
+        descriptor.fetchLimit = 100
+        guard let stale = try? modelContext.fetch(descriptor) else { return }
+        for t in stale {
+            t.transcriptionStatus = TranscriptionStatus.failed.rawValue
+        }
+        try? modelContext.save()
+        if !stale.isEmpty {
+            logger.info("Marked \(stale.count) stale file transcription(s) as failed")
+        }
+    }
+
+    // MARK: - Queue Processing
+
+    private func processQueue(modelContext: ModelContext, engine: VoiceSEngine) {
+        guard !isProcessingQueue else { return }
+        isProcessingQueue = true
+        isProcessing = true
+        errorMessage = nil
+
+        currentTask = Task {
+            while !queue.isEmpty {
+                let job = queue.removeFirst()
+                currentJob = job
+
+                job.transcription.transcriptionStatus = TranscriptionStatus.inProgress.rawValue
+                try? modelContext.save()
+
+                processingPhase = .loading
+                longAudioProgress = .idle
+
+                await processJob(job, modelContext: modelContext, engine: engine)
+
+                currentJob = nil
+            }
+
+            isProcessingQueue = false
+            isProcessing = false
+            processingPhase = .idle
+            longAudioProgress = .idle
+            currentTask = nil
+        }
+    }
+
+    private func processJob(
+        _ job: FileTranscriptionJob,
+        modelContext: ModelContext,
+        engine: VoiceSEngine
+    ) async {
+        let transcription = job.transcription
+        let permanentURL = job.permanentURL
+
+        do {
+            guard let currentModel = engine.transcriptionModelManager.currentTranscriptionModel else {
+                throw TranscriptionError.noModelSelected
+            }
+
+            let serviceRegistry = TranscriptionServiceRegistry(
+                modelProvider: engine.whisperModelManager,
+                modelsDirectory: engine.whisperModelManager.modelsDirectory,
+                modelContext: modelContext
+            )
+            defer { serviceRegistry.cleanup() }
+
+            processingPhase = .processingAudio
+
+            // Determine strategy
+            let serverCustomModel: CustomCloudModel?
+            let serverBaseURL: URL?
+            if let custom = currentModel as? CustomCloudModel,
+               let base = QwenServerJobStrategy.deriveBaseURL(from: custom.apiEndpoint) {
+                serverCustomModel = custom
+                serverBaseURL = base
+            } else if let fallbackCustom = CustomModelManager.shared.customModels.first(where: {
+                QwenServerJobStrategy.deriveBaseURL(from: $0.apiEndpoint) != nil
+            }) {
+                serverCustomModel = fallbackCustom
+                serverBaseURL = QwenServerJobStrategy.deriveBaseURL(from: fallbackCustom.apiEndpoint)
+            } else {
+                serverCustomModel = nil
+                serverBaseURL = nil
+            }
+
+            // For client chunking, we may need to convert to WAV.
+            // The file was copied as-is during enqueue. Convert now if needed.
+            let audioURL: URL
+            if serverBaseURL != nil {
+                audioURL = permanentURL
+            } else {
+                let samples = try await audioProcessor.processAudioToSamples(permanentURL)
+                let wavURL = permanentURL.deletingPathExtension().appendingPathExtension("wav")
+                if wavURL != permanentURL {
+                    try audioProcessor.saveSamplesAsWav(samples: samples, to: wavURL)
+                    audioURL = wavURL
+                    // Update the transcription record with the WAV URL
+                    transcription.audioFileURL = wavURL.absoluteString
+                } else {
+                    audioURL = permanentURL
+                }
+            }
+
+            // Update duration from actual audio
+            let audioAsset = AVURLAsset(url: audioURL)
+            let duration = CMTimeGetSeconds(try await audioAsset.load(.duration))
+            transcription.duration = duration
+
+            try Task.checkCancellation()
+
+            // Build strategy
+            let strategy: LongAudioTranscriptionStrategy
+            if let baseURL = serverBaseURL, let custom = serverCustomModel {
+                strategy = QwenServerJobStrategy(baseURL: baseURL, apiKey: custom.apiKey)
+                logger.info("Using QwenServerJobStrategy @ \(baseURL.absoluteString, privacy: .public)")
+            } else {
+                strategy = ClientChunkingStrategy(
+                    serviceRegistry: serviceRegistry,
+                    model: currentModel,
+                    audioProcessor: audioProcessor
+                )
+                logger.info("Using ClientChunkingStrategy for \(currentModel.displayName, privacy: .public)")
+            }
+
+            processingPhase = .transcribing
+            let transcriptionStart = Date()
+
+            let progressCallback: (LongAudioProgress) -> Void = { [weak self] progress in
+                self?.longAudioProgress = progress
+            }
+
+            let result: LongAudioResult
+            do {
+                result = try await strategy.transcribe(
+                    audioURL: audioURL,
+                    languageHint: job.languageHint,
+                    progress: progressCallback
+                )
+            } catch LongAudioTranscriptionError.asyncJobsNotSupported {
+                logger.info("Server doesn't support async jobs — falling back to client chunking")
+                let fallbackStrategy = ClientChunkingStrategy(
+                    serviceRegistry: serviceRegistry,
+                    model: currentModel,
+                    audioProcessor: audioProcessor
+                )
+                result = try await fallbackStrategy.transcribe(
+                    audioURL: audioURL,
+                    languageHint: job.languageHint,
+                    progress: progressCallback
+                )
+            } catch is CancellationError {
+                throw TranscriptionError.transcriptionCancelled
+            }
+
+            let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
+
+            var text = TranscriptionOutputFilter.filter(result.text)
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let powerModeManager = PowerModeManager.shared
+            let activePowerModeConfig = powerModeManager.currentActiveConfiguration
+            let powerModeName = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.name : nil
+            let powerModeEmoji = (activePowerModeConfig?.isEnabled == true) ? activePowerModeConfig?.emoji : nil
+
+            if UserDefaults.standard.bool(forKey: "IsTextFormattingEnabled") {
+                text = WhisperTextFormatter.format(text)
+            }
+
+            text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
+
+            // Update the pre-existing transcription record
+            transcription.text = text
+            transcription.transcriptionModelName = currentModel.displayName
+            transcription.transcriptionDuration = transcriptionDuration
+            transcription.powerModeName = powerModeName
+            transcription.powerModeEmoji = powerModeEmoji
+
+            // Handle enhancement if enabled at drop time
+            if job.isEnhancementEnabled,
+               let enhancementService = engine.enhancementService,
+               enhancementService.isConfigured {
+                // Apply captured prompt selection
+                if let promptId = job.selectedPromptId {
+                    enhancementService.selectedPromptId = promptId
+                }
+                processingPhase = .enhancing
+                do {
+                    let (enhancedText, enhancementDuration, promptName) = try await enhancementService.enhance(text)
+                    transcription.enhancedText = enhancedText
+                    transcription.aiEnhancementModelName = enhancementService.getAIService()?.currentModel
+                    transcription.promptName = promptName
+                    transcription.enhancementDuration = enhancementDuration
+                    transcription.aiRequestSystemMessage = enhancementService.lastSystemMessageSent
+                    transcription.aiRequestUserMessage = enhancementService.lastUserMessageSent
+                } catch {
+                    logger.error("Enhancement failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+
+            transcription.transcriptionStatus = TranscriptionStatus.completed.rawValue
+            try modelContext.save()
+            NotificationCenter.default.post(name: .transcriptionCreated, object: transcription)
+            NotificationCenter.default.post(name: .transcriptionCompleted, object: transcription)
+
+            processingPhase = .completed
+
+        } catch {
+            if error is CancellationError || (error as? TranscriptionError) == .transcriptionCancelled {
+                logger.info("Transcription cancelled for \(transcription.originalFileName ?? "unknown", privacy: .public)")
+                transcription.transcriptionStatus = TranscriptionStatus.failed.rawValue
+            } else {
+                logger.error("Transcription error for \(transcription.originalFileName ?? "unknown", privacy: .public): \(error.localizedDescription, privacy: .public)")
+                transcription.transcriptionStatus = TranscriptionStatus.failed.rawValue
+                errorMessage = error.localizedDescription
+            }
+            try? modelContext.save()
+        }
     }
 }
 

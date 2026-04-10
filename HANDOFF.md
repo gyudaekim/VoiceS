@@ -1944,12 +1944,11 @@ Replace the single combined progress bar (0-50% upload, 50-100% transcription) w
 
 ## Current git state
 
-All changes from this session are UNCOMMITTED. `git status` shows modifications to the 4 files listed above plus the new brainstorms doc. The previous session's changes (long-audio feature + review hardening) were committed and pushed as `248ef6f` and `104fafa`.
+All changes committed and pushed as `21210bc` on `main` (combined with session 3 changes).
 
 ## Remaining work
 
-1. **Commit and push** — suggest one commit: `fix: resolve upload failures and redesign Transcribe Audio progress UI`
-2. **Runtime smoke test with large file** — user was testing during this session; final status of 150 MB upload via Tailscale not confirmed yet
+1. **Runtime smoke test with large file** — user was testing during this session; final status of 150 MB upload via Tailscale not confirmed yet
 3. **Cloudflare fallback for off-VPN use** — when not on Tailscale, the `http://10.78.151.244:8000` endpoint is unreachable. User would need to switch back to `https://asr.synrz.com` for small files (< 100 MB). No auto-detection implemented yet.
 4. **Unit tests** — still not written for `AudioChunker.chunk`, `ChunkTextMerger.merge`, `QwenServerJobStrategy.deriveBaseURL` (carried over from prior session)
 
@@ -2065,15 +2064,11 @@ Both added to `init()` with `nil` defaults. SwiftData lightweight migration hand
 
 ## Current git state
 
-All changes from this session are UNCOMMITTED (on top of the also-uncommitted changes from session 2). `git status` will show all files from both sessions.
+All changes committed and pushed as `21210bc` on `main`. Combined commit covers both session 2 (bug fixes + progress UI) and session 3 (inline history list).
 
 ## Remaining work
 
-1. **Commit and push** — all sessions' changes are uncommitted. Suggest splitting into two commits:
-   - `fix: resolve upload failures and redesign progress UI` (session 2 changes)
-   - `feat: inline history list in Transcribe Audio tab` (session 3 changes)
-   - Or one combined commit if simpler
-2. **Runtime smoke test** — `make local && open ~/Downloads/VoiceS.app`
+1. **Runtime smoke test** — `make local && open ~/Downloads/VoiceS.app`
    - Transcribe a file → should NOT show full text result, instead a new row appears in the history list
    - Copy button on row → copies text to clipboard
    - Save button on row → opens save dialog for .md
@@ -2091,3 +2086,151 @@ Run `make local && open ~/Downloads/VoiceS.app`. Drop an audio file in the Trans
 - The History window (separate window) should NOT show this file transcription
 - Copy button should put the transcription text on clipboard
 - Save button should offer a .md download
+
+---
+
+# Session 4: Multi-File Queue & Icon Polish
+
+## Date: 2026-04-10 (continued)
+
+## Goal
+
+Add multi-file drag-and-drop queuing to the Transcribe Audio tab. Make icons bigger and clearer. Show in-progress and queued items in the history list. Auto-deselect the drop zone after starting transcription so the user can immediately drop more files.
+
+## Requirements doc
+
+`docs/brainstorms/2026-04-10-transcribe-queue-and-icons-requirements.md`
+
+## What was done
+
+### 1. TranscriptionStatus Enum (`VoiceS/Models/Transcription.swift`)
+
+Added two new cases:
+
+```swift
+case queued      // file waiting in queue
+case inProgress  // file currently being transcribed
+```
+
+No migration needed — `transcriptionStatus` is `String?`, new raw values are just new strings. Existing `.pending`, `.completed`, `.failed` cases untouched.
+
+### 2. AudioFileTranscriptionManager — Complete Rewrite (`VoiceS/Services/AudioFileTranscriptionManager.swift`)
+
+**Before**: Single-file processor. `startProcessing(url:...)` ran one file, created the Transcription record at the END after processing, and couldn't handle multiple files.
+
+**After**: Queue-based processor with these key components:
+
+**`FileTranscriptionJob` struct** — captures everything needed to process a file:
+- `permanentURL`: file copy in Recordings/ directory
+- `transcription`: pre-created SwiftData Transcription record
+- `languageHint`, `isEnhancementEnabled`, `selectedPromptId`: settings at drop time (R13)
+
+**`enqueueFiles(urls:modelContext:engine:languageHint:isEnhancementEnabled:selectedPromptId:)`** — new primary entry point:
+1. For each URL: acquire security scope → copy to Recordings/ → release scope
+2. Get audio duration via AVURLAsset
+3. Create Transcription record with `status: .queued`, `source: "file"`, `originalFileName`, `text: ""`
+4. Create FileTranscriptionJob, append to queue
+5. If not already processing, start `processQueue()`
+
+**`processQueue(modelContext:engine:)`** — sequential processing loop:
+- `while !queue.isEmpty`: removeFirst, set `.inProgress`, process, continue
+- On failure: mark `.failed`, move to next (R15)
+- When queue empty: reset all state
+
+**`processJob(_:modelContext:engine:)`** — extracted from old `startProcessing` body:
+- Takes `FileTranscriptionJob` instead of raw URL
+- **Updates** the pre-existing Transcription record (doesn't create a new one)
+- Uses `job.languageHint` and `job.isEnhancementEnabled` (captured settings, not global state)
+- On success: sets `.completed`, updates text/duration/model/enhancement fields
+- On failure: sets `.failed`, continues to next queue item
+
+**`startProcessing(url:...)`** — now a thin wrapper calling `enqueueFiles(urls: [url], ...)`
+
+**`cancelProcessing()`** — cancels current task + marks all queued items as `.failed` + clears queue (R14)
+
+**`cleanupStaleJobs(modelContext:)`** — marks leftover `.queued`/`.inProgress` file transcriptions as `.failed` on app launch (handles crash recovery)
+
+**Key architecture change**: Transcription records are created BEFORE processing (with empty `text` and `.queued` status). This means `@Query` in the view picks them up immediately — no need for a separate in-memory queue merged with query results.
+
+### 3. AudioTranscribeView — Complete Rewrite (`VoiceS/Views/AudioTranscribeView.swift`)
+
+**Layout change**: Drop zone is ALWAYS visible. The old mutual exclusion (`if isProcessing { processingView } else { dropZoneView }`) is gone. Progress is shown inline in the history list row, not as a separate full-width section.
+
+**Multi-file drop** (R11): `handleDroppedFiles()` iterates ALL providers (not just `providers.first`). Uses DispatchGroup to collect URLs from all providers asynchronously, then enqueues them all at once. Single-file drop still shows the selection UI; multi-file drop enqueues directly with current settings.
+
+**Multi-file select** (R11): `NSOpenPanel.allowsMultipleSelection = true`. Single file → selection UI. Multiple files → enqueue directly.
+
+**Auto-deselect** (R9): After `startProcessing` or multi-file enqueue, `selectedAudioURL = nil` and `isAudioFileSelected = false`. Drop zone returns to "drop here" state immediately.
+
+**Icons** (R1-R4):
+- All action icons bumped from `.font(.caption)` to `.font(.body)`
+- Download icon: `"arrow.down.doc"` → `"square.and.arrow.down"` (standard macOS download)
+- Copy icon: `"doc.on.doc"` (unchanged, just bigger)
+- Status icons use `@ViewBuilder func statusIcon(for:)`:
+  - `.completed` → green `"checkmark.circle.fill"` (.body)
+  - `.failed` → red `"xmark.circle.fill"` (.body)
+  - `.inProgress` → `ProgressView().controlSize(.small)` (native spinner)
+  - `.queued` → orange `"clock.fill"` (.body)
+
+**Custom sort** (R8): `sortedFileTranscriptions` computed property sorts: in-progress (0) → queued (1) → completed/failed (2), then by timestamp descending within each group.
+
+**Inline progress** (R6): In-progress row shows a thin `ProgressView(value:total:)` bar + phase message (`caption2` font) below the filename. Uses `transcriptionManager.longAudioProgress.progressPercent` and `transcriptionManager.processingPhase.message`.
+
+**Disabled buttons**: Copy and download are `.disabled(true)` for queued/in-progress items (no text yet).
+
+**Cancel button**: Shows in the list header when `transcriptionManager.isProcessing` is true.
+
+**Removed**: `processingView`, `uploadProgressSection`, `transcribingProgressSection`, `simulatedChunkPercent`, `lastSeenChunk`, 0.4s timer, `formatDuration(_:)` (unused).
+
+## What worked
+
+- **Build succeeds** — all changes compile cleanly
+- **SwiftData lightweight migration** — new enum raw values are just new strings, no VersionedSchema needed
+- **Creating Transcription records before processing** — `@Query` automatically picks up queued items, no manual view refresh needed
+- **DispatchGroup for multi-provider URL extraction** — handles async `loadItem` for each drag provider cleanly
+
+## What didn't work / gotchas
+
+- **AVURLAsset.duration is async in newer APIs** — `AVURLAsset(url:).duration` used in `enqueueFiles` needs careful handling. Used the synchronous `CMTimeGetSeconds` on the `duration` property which may return 0 for some formats. The actual duration is re-fetched inside `processJob` using the async `audioAsset.load(.duration)` which is more reliable. The initial 0 duration is acceptable since it's just for display in the queued row.
+
+- **Client chunking path needs WAV conversion** — files are copied as-is during enqueue (fast), but the client chunking strategy needs 16kHz mono WAV. `processJob` handles the conversion at processing time, writing a `.wav` file alongside the original copy and updating `transcription.audioFileURL`. If the file is already `.wav`, it checks path equality to avoid double-writing.
+
+- **Security-scoped resources** — drag-and-drop URLs have security scope that expires quickly. The solution: copy files to Recordings/ during enqueue (while scope is active), then process from the permanent copy. This avoids scope expiration for queued files.
+
+- **Enhancement settings capture** — `FileTranscriptionJob` stores `isEnhancementEnabled` and `selectedPromptId` at drop time. Before enhancing, the captured `selectedPromptId` is applied to the enhancement service. This means the user can change settings between batches and each batch uses its own settings.
+
+## Files changed
+
+| File | Lines changed | What |
+|------|--------------|------|
+| `VoiceS/Models/Transcription.swift` | +2 | `.queued`, `.inProgress` enum cases |
+| `VoiceS/Services/AudioFileTranscriptionManager.swift` | complete rewrite (~300 lines) | FileTranscriptionJob, queue logic, enqueueFiles, processQueue, processJob |
+| `VoiceS/Views/AudioTranscribeView.swift` | complete rewrite (~400 lines) | Always-visible drop zone, multi-file drop/select, bigger icons, status display, inline progress, auto-deselect |
+| `docs/brainstorms/2026-04-10-transcribe-queue-and-icons-requirements.md` | new | Requirements doc for this iteration |
+
+## Current git state
+
+All changes from this session are UNCOMMITTED. Previous session's changes were committed as `21210bc`.
+
+## Remaining work
+
+1. **Commit and push** — suggest: `feat: multi-file queue and icon polish for Transcribe Audio tab`
+2. **Runtime smoke test** — `make local && open ~/Downloads/VoiceS.app`
+   - Drop 3 audio files at once → all 3 appear in list (1 in-progress with spinner, 2 queued with clock icon)
+   - Files process one at a time, status updates in real time
+   - Drop zone stays ready throughout — drop more files while processing
+   - Single file drop → shows selection UI with settings
+   - Icons are clearly visible at body size
+   - Download icon is the standard downward arrow
+   - Cancel button stops everything
+   - Restart app → stale queued/in-progress items marked as failed
+3. **Unit tests** — still not written (carried from sessions 1-3)
+4. **Cloudflare fallback** — still no auto-detection
+
+## If you only have time for one thing
+
+Run `make local && open ~/Downloads/VoiceS.app`. Drop 3 audio files onto the Transcribe Audio tab simultaneously. You should see:
+- All 3 appear in the history list: 1 with a spinner (in-progress), 2 with orange clock icons (queued)
+- Drop zone stays visible and ready for more files
+- Files process one by one, transitioning from queued → in-progress → completed (green checkmark)
+- Icons (copy, download, status) are clearly visible, not tiny

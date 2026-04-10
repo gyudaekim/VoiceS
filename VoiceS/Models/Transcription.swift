@@ -3,6 +3,8 @@ import SwiftData
 
 enum TranscriptionStatus: String, Codable {
     case pending
+    case queued
+    case inProgress
     case completed
     case failed
 }
