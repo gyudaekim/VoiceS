@@ -111,7 +111,10 @@ class AudioTranscriptionService: ObservableObject {
                         aiRequestSystemMessage: enhancementService.lastSystemMessageSent,
                         aiRequestUserMessage: enhancementService.lastUserMessageSent,
                         powerModeName: powerModeName,
-                        powerModeEmoji: powerModeEmoji
+                        powerModeEmoji: powerModeEmoji,
+                        source: "file",
+                        originalFileName: url.lastPathComponent,
+                        transcriptionStatus: .completed
                     )
                     modelContext.insert(newTranscription)
                     do {
@@ -142,7 +145,10 @@ class AudioTranscriptionService: ObservableObject {
                         promptName: nil,
                         transcriptionDuration: transcriptionDuration,
                         powerModeName: powerModeName,
-                        powerModeEmoji: powerModeEmoji
+                        powerModeEmoji: powerModeEmoji,
+                        source: "file",
+                        originalFileName: url.lastPathComponent,
+                        transcriptionStatus: .completed
                     )
                     modelContext.insert(newTranscription)
                     do {
@@ -168,7 +174,10 @@ class AudioTranscriptionService: ObservableObject {
                     promptName: nil,
                     transcriptionDuration: transcriptionDuration,
                     powerModeName: powerModeName,
-                    powerModeEmoji: powerModeEmoji
+                    powerModeEmoji: powerModeEmoji,
+                    source: "file",
+                    originalFileName: url.lastPathComponent,
+                    transcriptionStatus: .completed
                 )
                 modelContext.insert(newTranscription)
                 do {

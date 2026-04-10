@@ -286,6 +286,7 @@ class VoiceSEngine: NSObject, ObservableObject {
             text: "",
             duration: duration,
             audioFileURL: activeRecording.audioURL.absoluteString,
+            source: "recording",
             transcriptionStatus: .pending
         )
         modelContext.insert(transcription)

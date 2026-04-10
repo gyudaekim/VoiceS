@@ -8,12 +8,24 @@ struct AudioTranscribeView: View {
     @EnvironmentObject private var engine: VoiceSEngine
     @EnvironmentObject private var enhancementService: AIEnhancementService
     @StateObject private var transcriptionManager = AudioTranscriptionManager.shared
+    @Query(
+        filter: #Predicate<Transcription> { $0.source == "file" },
+        sort: \Transcription.timestamp,
+        order: .reverse
+    ) private var fileTranscriptions: [Transcription]
     @State private var isDropTargeted = false
     @State private var selectedAudioURL: URL?
     @State private var isAudioFileSelected = false
     @State private var isEnhancementEnabled = false
     @State private var selectedPromptId: UUID?
+    @State private var showFullHistory = false
     @AppStorage("TranscribeAudioLanguage") private var selectedLanguage: String = "auto"
+
+    // Simulated per-chunk progress: animated from 0→~95% when a chunk starts,
+    // resets when the next chunk begins. Gives visual feedback even when real
+    // intra-chunk data is unavailable or too coarse (server polls every 2.5s).
+    @State private var simulatedChunkPercent: Double = 0
+    @State private var lastSeenChunk: Int = 0
 
     // Ordered language hints matching the gdk-server Qwen ASR web UI dropdown.
     private let languageOptions: [(code: String, label: String)] = [
@@ -31,36 +43,23 @@ struct AudioTranscribeView: View {
         ZStack {
             Color(NSColor.controlBackgroundColor)
                 .ignoresSafeArea()
-            
+
             VStack(spacing: 0) {
                 if transcriptionManager.isProcessing {
                     processingView
                 } else {
                     dropZoneView
                 }
-                
+
                 Divider()
                     .padding(.vertical)
-                
-                // Show current transcription result
-                if let transcription = transcriptionManager.currentTranscription {
-                    VStack(alignment: .leading, spacing: 8) {
-                        TranscriptionResultView(transcription: transcription)
 
-                        if let markdown = transcriptionManager.currentTranscriptionMarkdown, !markdown.isEmpty {
-                            HStack {
-                                Spacer()
-                                MarkdownDownloadButton(
-                                    markdown: markdown,
-                                    sourceFileName: URL(string: transcription.audioFileURL ?? "")?.lastPathComponent
-                                )
-                            }
-                            .padding(.horizontal)
-                            .padding(.bottom, 8)
-                        }
-                    }
-                }
+                // Recent file transcription history
+                fileTranscriptionHistorySection
             }
+        }
+        .sheet(isPresented: $showFullHistory) {
+            fileTranscriptionFullHistorySheet
         }
         .onDrop(of: [.fileURL, .data, .audio, .movie], isTargeted: $isDropTargeted) { providers in
             if !transcriptionManager.isProcessing && !isAudioFileSelected {
@@ -77,6 +76,20 @@ struct AudioTranscribeView: View {
             if let errorMessage = transcriptionManager.errorMessage {
                 Text(errorMessage)
             }
+        }
+        .onReceive(Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()) { _ in
+            // Drive simulated per-chunk progress: fast start, asymptotic approach to 95%.
+            guard transcriptionManager.longAudioProgress.status == .running else {
+                if simulatedChunkPercent != 0 { simulatedChunkPercent = 0 }
+                return
+            }
+            let current = transcriptionManager.longAudioProgress.currentChunk ?? 0
+            if current != lastSeenChunk {
+                lastSeenChunk = current
+                simulatedChunkPercent = 0
+            }
+            let remaining = 95.0 - simulatedChunkPercent
+            simulatedChunkPercent += remaining * 0.08
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFileForTranscription)) { notification in
             if let url = notification.userInfo?["url"] as? URL {
@@ -167,7 +180,7 @@ struct AudioTranscribeView: View {
                     .padding(.vertical, 6)
                     .background(CardBackground(isSelected: false))
 
-                    // Action Buttons in a row
+                    // Action Buttons
                     HStack(spacing: 12) {
                         Button("Start Transcription") {
                             if let url = selectedAudioURL {
@@ -182,10 +195,19 @@ struct AudioTranscribeView: View {
                         .buttonStyle(.borderedProminent)
 
                         Button("Choose Different File") {
-                            selectedAudioURL = nil
-                            isAudioFileSelected = false
+                            selectFile()
                         }
                         .buttonStyle(.bordered)
+
+                        Button(role: .destructive) {
+                            selectedAudioURL = nil
+                            isAudioFileSelected = false
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundColor(.secondary)
+                        .help("Clear selection")
                     }
                 }
                 .padding()
@@ -235,35 +257,40 @@ struct AudioTranscribeView: View {
     
     private var processingView: some View {
         let progress = transcriptionManager.longAudioProgress
-        let phaseMessage = transcriptionManager.processingPhase.message
+        let phase = transcriptionManager.processingPhase
 
         return VStack(alignment: .leading, spacing: 16) {
-            Text(phaseMessage.isEmpty ? "Working…" : phaseMessage)
+            // Phase header
+            Text(phase.message.isEmpty ? "Working…" : phase.message)
                 .font(.headline)
 
-            if let percent = progress.progressPercent {
-                ProgressView(value: percent, total: 100)
-                    .progressViewStyle(.linear)
-            } else {
+            switch progress.status {
+            case .uploading:
+                // ── Phase 1: Upload ──
+                uploadProgressSection(progress: progress)
+
+            case .running, .queued:
+                // ── Phase 2: Transcribing ──
+                transcribingProgressSection(progress: progress)
+
+            default:
+                // Loading / idle / other — indeterminate
                 ProgressView()
                     .progressViewStyle(.linear)
             }
 
+            // Bottom row: metadata + cancel
             HStack(spacing: 12) {
-                if let chunkLabel = progress.chunkLabel {
-                    Label("Chunk \(chunkLabel)", systemImage: "square.grid.2x2")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                if let percent = progress.progressPercent {
-                    Text(String(format: "%.0f%%", percent))
-                        .font(.subheadline.monospacedDigit())
-                        .foregroundColor(.secondary)
-                }
                 if let language = progress.detectedLanguage, !language.isEmpty {
                     Label(language, systemImage: "globe")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
+                }
+                if !progress.message.isEmpty {
+                    Text(progress.message)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
                 Button("Cancel") {
@@ -272,20 +299,252 @@ struct AudioTranscribeView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-
-            if !progress.message.isEmpty {
-                Text(progress.message)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-            }
         }
         .padding(20)
         .frame(maxWidth: 560)
         .background(CardBackground(isSelected: false))
         .padding()
     }
+
+    // MARK: - Phase 1: Upload progress
+
+    private func uploadProgressSection(progress: LongAudioProgress) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Upload")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                if let percent = progress.progressPercent {
+                    Text(String(format: "%.0f%%", percent))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+            }
+            if let percent = progress.progressPercent {
+                ProgressView(value: percent, total: 100)
+                    .progressViewStyle(.linear)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+        }
+    }
+
+    // MARK: - Phase 2: Transcribing progress (per-chunk + overall)
+
+    private func transcribingProgressSection(progress: LongAudioProgress) -> some View {
+        let totalChunks = progress.totalChunks ?? 0
+        let currentChunk = progress.currentChunk ?? 0
+        // Overall = completed chunks / total. Use progressPercent from server if available
+        // (more accurate), otherwise compute from chunk count.
+        let overallPercent: Double = {
+            if let serverPercent = progress.progressPercent, serverPercent > 0 {
+                return serverPercent
+            }
+            return totalChunks > 0 ? Double(currentChunk) / Double(totalChunks) * 100.0 : 0
+        }()
+
+        return VStack(alignment: .leading, spacing: 12) {
+            // Per-chunk bar — uses simulated progress (timer-driven asymptotic animation)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Chunk \(currentChunk > 0 ? "\(currentChunk)" : "–") / \(totalChunks > 0 ? "\(totalChunks)" : "–")")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(String(format: "%.0f%%", simulatedChunkPercent))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                ProgressView(value: simulatedChunkPercent, total: 100)
+                    .progressViewStyle(.linear)
+                    .tint(.orange)
+                    .animation(.linear(duration: 0.3), value: simulatedChunkPercent)
+            }
+
+            // Overall bar — real data from chunk count or server progress
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Overall")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(String(format: "%.0f%%", overallPercent))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                ProgressView(value: overallPercent, total: 100)
+                    .progressViewStyle(.linear)
+            }
+        }
+    }
     
+    // MARK: - File Transcription History
+
+    private var fileTranscriptionHistorySection: some View {
+        Group {
+            if fileTranscriptions.isEmpty {
+                Spacer()
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Recent Transcriptions")
+                        .font(.headline)
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
+
+                    ForEach(fileTranscriptions.prefix(5)) { transcription in
+                        fileTranscriptionRow(transcription)
+                        if transcription.id != fileTranscriptions.prefix(5).last?.id {
+                            Divider().padding(.horizontal)
+                        }
+                    }
+
+                    if fileTranscriptions.count > 5 {
+                        Button {
+                            showFullHistory = true
+                        } label: {
+                            HStack {
+                                Spacer()
+                                Text("View More (\(fileTranscriptions.count) total)")
+                                    .font(.subheadline)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
+                        .padding(.vertical, 8)
+                    }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private func fileTranscriptionRow(_ transcription: Transcription) -> some View {
+        let displayName = transcription.originalFileName
+            ?? URL(string: transcription.audioFileURL ?? "")?.lastPathComponent
+            ?? "Unknown"
+        let bestText = transcription.enhancedText ?? transcription.text
+
+        return HStack(spacing: 10) {
+            Image(systemName: "doc.richtext")
+                .foregroundColor(.secondary)
+                .frame(width: 20)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                HStack(spacing: 8) {
+                    Text(formatDurationLong(transcription.duration))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Text(transcription.timestamp, style: .date)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Spacer()
+
+            // Status indicator
+            if transcription.transcriptionStatus == TranscriptionStatus.completed.rawValue {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                    .font(.caption)
+            } else if transcription.transcriptionStatus == TranscriptionStatus.failed.rawValue {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.red)
+                    .font(.caption)
+            } else {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                    .font(.caption)
+            }
+
+            // Copy button
+            Button {
+                ClipboardManager.copyToClipboard(bestText)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .help("Copy transcription text")
+
+            // Save as Markdown button
+            Button {
+                saveAsMarkdown(text: bestText, fileName: displayName)
+            } label: {
+                Image(systemName: "arrow.down.doc")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .help("Save as Markdown")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    private var fileTranscriptionFullHistorySheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("All File Transcriptions")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    showFullHistory = false
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding()
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(fileTranscriptions) { transcription in
+                        fileTranscriptionRow(transcription)
+                        Divider().padding(.horizontal)
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 500, minHeight: 400)
+    }
+
+    private func saveAsMarkdown(text: String, fileName: String) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.text]
+        let stem = (fileName as NSString).deletingPathExtension
+        panel.nameFieldStringValue = "\(stem.isEmpty ? "transcription" : stem).md"
+        panel.title = "Save Transcription"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        let markdown = "# Transcription\n\n**Date:** \(formatter.string(from: Date()))\n\n\(text)"
+        do {
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSSound.beep()
+        }
+    }
+
+    private func formatDurationLong(_ duration: TimeInterval) -> String {
+        let totalSeconds = Int(duration)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
     private func selectFile() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
@@ -384,59 +643,3 @@ struct AudioTranscribeView: View {
     }
 }
 
-/// Writes the raw Markdown produced by the long-audio transcription flow to a user-chosen
-/// file. Separate from `AnimatedSaveButton` because that one re-wraps plain text in a
-/// `# Transcription` header; long-audio Markdown already has its own header from either
-/// the server or `ClientChunkingStrategy.buildMarkdown`.
-private struct MarkdownDownloadButton: View {
-    let markdown: String
-    let sourceFileName: String?
-
-    @State private var isSaved: Bool = false
-
-    var body: some View {
-        Button(action: save) {
-            HStack(spacing: 6) {
-                Image(systemName: isSaved ? "checkmark" : "arrow.down.doc")
-                Text(isSaved ? "Downloaded" : "Download Markdown")
-            }
-            .font(.system(size: 12, weight: .medium))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-                Capsule()
-                    .fill(isSaved ? Color.green.opacity(0.85) : Color.accentColor)
-            )
-            .foregroundColor(.white)
-        }
-        .buttonStyle(.plain)
-        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isSaved)
-    }
-
-    private func save() {
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.text]
-        panel.nameFieldStringValue = "\(defaultFileName()).md"
-        panel.title = "Save Transcription"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try markdown.write(to: url, atomically: true, encoding: .utf8)
-            withAnimation { isSaved = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                withAnimation { isSaved = false }
-            }
-        } catch {
-            NSSound.beep()
-        }
-    }
-
-    private func defaultFileName() -> String {
-        if let source = sourceFileName, !source.isEmpty {
-            let stem = (source as NSString).deletingPathExtension
-            if !stem.isEmpty { return stem }
-        }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmm"
-        return "transcription-\(formatter.string(from: Date()))"
-    }
-}

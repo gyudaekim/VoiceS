@@ -63,6 +63,11 @@ class AudioTranscriptionManager: ObservableObject {
         errorMessage = nil
 
         currentTask = Task {
+            // Re-acquire security-scoped access for the file URL — the original scope
+            // from validateAndSetAudioFile was released in its defer block before this Task runs.
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
             do {
                 guard let currentModel = engine.transcriptionModelManager.currentTranscriptionModel else {
                     throw TranscriptionError.noModelSelected
@@ -84,8 +89,30 @@ class AudioTranscriptionManager: ObservableObject {
 
                 // Decide strategy early so we know whether to keep the original file as-is
                 // (server path) or pre-convert to 16 kHz mono WAV (client chunking path).
-                let serverBaseURL: URL? = (currentModel as? CustomCloudModel)
-                    .flatMap { QwenServerJobStrategy.deriveBaseURL(from: $0.apiEndpoint) }
+                //
+                // First check if the current model is a CustomCloudModel. If not (e.g., a
+                // predefined QwenModel won the name-collision in allAvailableModels), scan
+                // CustomModelManager for any registered model whose endpoint matches the
+                // async job pattern. This lets the server path activate even when the user
+                // selects the predefined local model name.
+                let serverCustomModel: CustomCloudModel?
+                let serverBaseURL: URL?
+                if let custom = currentModel as? CustomCloudModel,
+                   let base = QwenServerJobStrategy.deriveBaseURL(from: custom.apiEndpoint) {
+                    serverCustomModel = custom
+                    serverBaseURL = base
+                    logger.info("Derived server base URL: \(base.absoluteString, privacy: .public) from selected CustomCloudModel endpoint: \(custom.apiEndpoint, privacy: .public)")
+                } else if let fallbackCustom = CustomModelManager.shared.customModels.first(where: {
+                    QwenServerJobStrategy.deriveBaseURL(from: $0.apiEndpoint) != nil
+                }) {
+                    serverCustomModel = fallbackCustom
+                    serverBaseURL = QwenServerJobStrategy.deriveBaseURL(from: fallbackCustom.apiEndpoint)
+                    logger.info("Selected model \(currentModel.displayName, privacy: .public) is not a CustomCloudModel, but found server-compatible CustomCloudModel '\(fallbackCustom.displayName, privacy: .public)' at \(fallbackCustom.apiEndpoint, privacy: .public)")
+                } else {
+                    serverCustomModel = nil
+                    serverBaseURL = nil
+                    logger.info("No server-compatible CustomCloudModel found — will use client chunking for \(currentModel.displayName, privacy: .public)")
+                }
 
                 // Prepare permanent audio file for SwiftData Transcription.audioFileURL
                 let recordingsDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -115,7 +142,7 @@ class AudioTranscriptionManager: ObservableObject {
 
                 // Build the strategy
                 let strategy: LongAudioTranscriptionStrategy
-                if let baseURL = serverBaseURL, let custom = currentModel as? CustomCloudModel {
+                if let baseURL = serverBaseURL, let custom = serverCustomModel {
                     strategy = QwenServerJobStrategy(baseURL: baseURL, apiKey: custom.apiKey)
                     logger.info("Using QwenServerJobStrategy @ \(baseURL.absoluteString, privacy: .public)")
                 } else {
@@ -199,7 +226,10 @@ class AudioTranscriptionManager: ObservableObject {
                             aiRequestSystemMessage: enhancementService.lastSystemMessageSent,
                             aiRequestUserMessage: enhancementService.lastUserMessageSent,
                             powerModeName: powerModeName,
-                            powerModeEmoji: powerModeEmoji
+                            powerModeEmoji: powerModeEmoji,
+                            source: "file",
+                            originalFileName: url.lastPathComponent,
+                            transcriptionStatus: .completed
                         )
                         modelContext.insert(transcription)
                         try modelContext.save()
@@ -216,7 +246,10 @@ class AudioTranscriptionManager: ObservableObject {
                             promptName: nil,
                             transcriptionDuration: transcriptionDuration,
                             powerModeName: powerModeName,
-                            powerModeEmoji: powerModeEmoji
+                            powerModeEmoji: powerModeEmoji,
+                            source: "file",
+                            originalFileName: url.lastPathComponent,
+                            transcriptionStatus: .completed
                         )
                         modelContext.insert(transcription)
                         try modelContext.save()
@@ -233,7 +266,10 @@ class AudioTranscriptionManager: ObservableObject {
                         promptName: nil,
                         transcriptionDuration: transcriptionDuration,
                         powerModeName: powerModeName,
-                        powerModeEmoji: powerModeEmoji
+                        powerModeEmoji: powerModeEmoji,
+                        source: "file",
+                        originalFileName: url.lastPathComponent,
+                        transcriptionStatus: .completed
                     )
                     modelContext.insert(transcription)
                     try modelContext.save()

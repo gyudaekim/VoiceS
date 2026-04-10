@@ -1842,3 +1842,252 @@ Prioritized:
 ## If you only have time for one thing
 
 Run `make local && open ~/Downloads/VoiceS.app`. Drop a 2-minute WAV file with a local Whisper model selected. If the progress bar fills, chunks show `X / Y`, text appears at the end, and `Download Markdown` writes a valid `.md` — the refactor + review hardening is done.
+
+---
+
+# Transcribe Audio — Bug Fixes & Progress UI Redesign (2026-04-10, session 2)
+
+## What happened in this session
+
+This session addressed three bugs and one UX redesign for the Transcribe Audio tab's long-audio feature that was implemented in the prior session.
+
+## Bug 1: File upload to server never started
+
+### Root cause
+
+`AudioFileTranscriptionManager.startProcessing` checked `currentModel as? CustomCloudModel` to decide between server and client strategies. But `PredefinedModels.models` returns `predefinedModels + CustomModelManager.shared.customModels` — predefined models come FIRST. When a Custom Cloud Model has the same `name` as a predefined local `QwenModel` (e.g., both "qwen3-asr-1.7b"), `allAvailableModels.first(where: { $0.name == savedModelName })` always returns the predefined LOCAL `QwenModel`, never the `CustomCloudModel`. So `currentModel as? CustomCloudModel` always failed, and the server strategy was never selected.
+
+### Fix applied
+
+`AudioFileTranscriptionManager.swift`: Added fallback — when `currentModel` is NOT a `CustomCloudModel`, scan `CustomModelManager.shared.customModels` for any model whose endpoint matches the async job pattern (`/v1/audio/transcriptions` suffix). If found, use that `CustomCloudModel` for the server strategy. This means the server path activates even when the user has the predefined local Qwen model selected, as long as a server-compatible Custom Cloud Model exists.
+
+### Additional fixes applied in the same pass
+
+- **Security-scoped resource re-acquisition**: Added `url.startAccessingSecurityScopedResource()` + `defer { stop }` at the top of the `Task {}` block in `startProcessing`. Not actually needed (app is NOT sandboxed, `app-sandbox: false`), but harmless and correct for defense-in-depth.
+- **Clear-attachment button**: Added X button (`xmark.circle.fill`) to the file-selected view. "Choose Different File" now opens `selectFile()` (NSOpenPanel) instead of just clearing state.
+- **Health check error swallowing**: `verifyServerSupportsAsyncJobs()` had a catch-all that converted ALL errors (network, ATS, DNS, timeout) into `asyncJobsNotSupported`, causing silent fallback to `ClientChunkingStrategy`. Fixed to only throw `asyncJobsNotSupported` for "reachable but not Qwen" responses. Network errors now propagate to the user as real error alerts.
+- **Diagnostic logging**: Added strategy selection logging in `AudioFileTranscriptionManager` — logs which model is selected, whether it's a CustomCloudModel, the derived server base URL, and which strategy was chosen.
+
+## Bug 2: Large file upload stalls at 4 MB (1%)
+
+### Root cause
+
+Cloudflare Free plan enforces a **100 MB request body limit** at the CDN edge. A 150 MB file exceeds this. Cloudflare reads the initial ~4 MB, detects `Content-Length: 150MB`, and drops the TCP connection. The upload stalls without an error response.
+
+### Fix applied
+
+- **`VoiceS/Info.plist`**: Added `NSAppTransportSecurity` → `NSAllowsArbitraryLoads: YES`. This allows `URLSession` to connect to `http://` URLs, enabling direct Tailscale uploads to `http://10.78.151.244:8000` that bypass Cloudflare entirely (no size limit).
+- **User action required**: Change the Custom Cloud Model endpoint from `https://asr.synrz.com/v1/audio/transcriptions` to `http://10.78.151.244:8000/v1/audio/transcriptions` for large file support. When on Tailscale, uploads go directly to the gdk-server.
+
+## Bug 3: Upload timeout for large files
+
+### Root cause
+
+`URLRequest.timeoutInterval` defaults to 60 seconds. Large file uploads over slower connections exceed this.
+
+### Fix applied
+
+- **`QwenServerJobStrategy.swift`**: Set `request.timeoutInterval = 600` (10 minutes) and `config.timeoutIntervalForRequest = 600` for the upload session.
+- **Upload progress tracking**: Replaced `URLSession.shared.upload(for:fromFile:)` with a custom `URLSession` using `UploadProgressDelegate` (implements `URLSessionTaskDelegate.urlSession(_:task:didSendBodyData:...)`) that reports bytes sent → UI shows "Uploading 12.5 / 45.3 MB…" with a moving progress bar.
+
+## UX Redesign: Two-phase progress UI
+
+### Requirement (from brainstorm doc `docs/brainstorms/2026-04-10-transcribe-progress-ui-requirements.md`)
+
+Replace the single combined progress bar (0-50% upload, 50-100% transcription) with two distinct phases:
+
+**Phase 1 — Upload**: Single bar, 0-100% of upload bytes, "Uploading X / Y MB"
+**Phase 2 — Transcribing**: Two stacked bars:
+- Per-chunk bar (orange): simulated progress animation, 0→~95% over ~15 seconds per chunk
+- Overall bar: real data from `currentChunk / totalChunks` or server `progress_percent`
+
+### Implementation
+
+**`QwenServerJobStrategy.swift`**:
+- Upload progress changed from 0-50% to 0-100% (raw upload bytes)
+- Poll progress changed from 50-100% remapped to 0-100% pass-through (server's `progress_percent` as-is)
+
+**`AudioTranscribeView.swift` — `processingView`**:
+- Rewrote to switch on `progress.status`:
+  - `.uploading` → `uploadProgressSection()` — single bar
+  - `.running` / `.queued` → `transcribingProgressSection()` — two stacked bars
+  - default → indeterminate
+- Per-chunk bar uses **simulated progress** (timer-driven asymptotic animation, `remaining * 0.08` every 0.4s) instead of derived server data, because:
+  - Server polling is too coarse (2.5s) — per-chunk progress was always 99-100% by the time we polled
+  - Client path has no intra-chunk progress at all
+  - Simulated animation feels responsive and honest (resets on chunk change)
+- Overall bar uses real data: server `progress_percent` when available, else `currentChunk / totalChunks * 100`
+- Added `@State simulatedChunkPercent` and `lastSeenChunk` + `Timer.publish(every: 0.4)` to drive the animation
+
+## Files changed (this session)
+
+| Path | Change |
+|---|---|
+| `VoiceS/Services/AudioFileTranscriptionManager.swift` | CustomCloudModel fallback scan, security-scoped resource re-acquisition, diagnostic logging |
+| `VoiceS/Services/LongAudio/QwenServerJobStrategy.swift` | Health check error propagation, upload timeout (600s), `UploadProgressDelegate` for bytes-sent tracking, progress range fix (0-100% per phase), `UploadProgressDelegate` class at EOF |
+| `VoiceS/Views/AudioTranscribeView.swift` | Clear-attachment X button, "Choose Different File" → `selectFile()`, two-phase `processingView` rewrite, simulated per-chunk progress timer, `uploadProgressSection()` and `transcribingProgressSection()` functions |
+| `VoiceS/Info.plist` | `NSAppTransportSecurity` → `NSAllowsArbitraryLoads: YES` |
+| `docs/brainstorms/2026-04-10-transcribe-progress-ui-requirements.md` | NEW — brainstorm requirements doc for progress UI redesign |
+
+## What worked
+
+- **CustomCloudModel fallback scan** solved the name-collision problem cleanly — server strategy now activates regardless of which model is "selected" in the global settings, as long as a server-compatible Custom Cloud Model exists
+- **ATS exception (`NSAllowsArbitraryLoads`)** enables direct Tailscale HTTP uploads with zero Cloudflare overhead
+- **Simulated per-chunk progress** (exponential decay animation) feels natural and responsive — much better than the real data which was always 99-100%
+- **Two-phase progress UI** clearly separates upload from transcription — user can tell exactly what the app is doing
+
+## What didn't work
+
+- **Security-scoped resource fix** was a red herring — the app isn't sandboxed (`app-sandbox: false`), so `startAccessingSecurityScopedResource` is a no-op. Left the code in as defense-in-depth but it didn't fix the upload issue.
+- **Deriving per-chunk progress from server `progress_percent`** was too coarse — server polls every 2.5s, and by the time we poll, the chunk is almost done. Replaced with simulated animation.
+- **Combined 0-50% / 50-100% progress mapping** was confusing to users — upload at 28% showed as 14% overall. Replaced with dedicated per-phase 0-100% bars.
+
+## Current git state
+
+All changes from this session are UNCOMMITTED. `git status` shows modifications to the 4 files listed above plus the new brainstorms doc. The previous session's changes (long-audio feature + review hardening) were committed and pushed as `248ef6f` and `104fafa`.
+
+## Remaining work
+
+1. **Commit and push** — suggest one commit: `fix: resolve upload failures and redesign Transcribe Audio progress UI`
+2. **Runtime smoke test with large file** — user was testing during this session; final status of 150 MB upload via Tailscale not confirmed yet
+3. **Cloudflare fallback for off-VPN use** — when not on Tailscale, the `http://10.78.151.244:8000` endpoint is unreachable. User would need to switch back to `https://asr.synrz.com` for small files (< 100 MB). No auto-detection implemented yet.
+4. **Unit tests** — still not written for `AudioChunker.chunk`, `ChunkTextMerger.merge`, `QwenServerJobStrategy.deriveBaseURL` (carried over from prior session)
+
+## If you only have time for one thing
+
+Run `make local && open ~/Downloads/VoiceS.app`. Set the Custom Cloud Model endpoint to `http://10.78.151.244:8000/v1/audio/transcriptions`. Drop a large audio file. Watch:
+- Phase 1: upload bar fills 0→100% with MB counter
+- Phase 2: orange per-chunk bar animates 0→~95% per chunk, overall bar shows real chunk progress
+- Result appears with Download Markdown button
+
+---
+
+# Session 3: Transcribe Audio Tab — Inline History List
+
+## Date: 2026-04-10 (continued)
+
+## Goal
+
+Replace the full-text transcription result display in the Transcribe Audio tab with a compact history list. File transcription results should appear only in the Transcribe Audio tab, NOT in the separate History window.
+
+## Requirements doc
+
+`docs/brainstorms/2026-04-10-transcribe-audio-history-list-requirements.md` — full requirements with stable IDs (R1–R16).
+
+## What was done
+
+### 1. Transcription Model — New Fields (`VoiceS/Models/Transcription.swift`)
+
+Added two new optional properties:
+
+```swift
+var source: String?           // "file" or "recording", nil = legacy (treated as recording)
+var originalFileName: String? // User's original filename before rename to transcribed_UUID.ext
+```
+
+Both added to `init()` with `nil` defaults. SwiftData lightweight migration handles this without `VersionedSchema` — existing rows get `nil` for both fields.
+
+**Why `source` is needed**: The `audioFileURL` contains `transcribed_UUID.ext` for file transcriptions and `UUID.wav` for live recordings — not reliably distinguishable. A dedicated `source` field is the only clean way to filter.
+
+**Why `originalFileName` is needed**: `audioFileURL` stores the renamed permanent copy path (`transcribed_3A7B2F1C...mp3`), not the user's original filename (`meeting-notes.m4a`). Without this field, the history list would show UUID-based names.
+
+### 2. Creation Sites Updated (7 total)
+
+**`AudioFileTranscriptionManager.swift`** — 3 Transcription init calls (lines ~216, ~240, ~258):
+- Added `source: "file"`
+- Added `originalFileName: url.lastPathComponent` (captured from the original user-selected URL, not the renamed `permanentURL`)
+- Added `transcriptionStatus: .completed` — previously defaulted to `.pending` which was a bug (file transcriptions were always "pending" in the data model even when complete)
+
+**`AudioFileTranscriptionService.swift`** — 3 Transcription init calls (lines ~101, ~140, ~166):
+- Same additions: `source: "file"`, `originalFileName: url.lastPathComponent`, `transcriptionStatus: .completed`
+
+**`VoiceSEngine.swift`** — 1 Transcription init call (line ~285):
+- Added `source: "recording"` (live recordings only)
+
+### 3. History Window Filtering (`VoiceS/Views/History/TranscriptionHistoryView.swift`)
+
+4 query sites updated to exclude file transcriptions:
+
+1. **`createLatestTranscriptionIndicatorDescriptor()`** — Added predicate `$0.source != "file"`
+2. **`cursorQueryDescriptor()`** — Added `transcription.source != "file"` to all 4 predicate branches (search+cursor, cursor-only, search-only, no-filter). Note: the no-filter branch previously had NO predicate — I added one with just the source filter.
+3. **`selectAllTranscriptions()`** — Added `transcription.source != "file"` to both branches (with-search and without-search).
+
+**NOT filtered** (intentionally): `AudioCleanupManager`, `TranscriptionAutoCleanupService`, `MetricsContent`, `LastTranscriptionService` — these should continue operating on all records regardless of source.
+
+**SwiftData nil handling**: `source != "file"` correctly evaluates to `true` when `source` is `nil`, so legacy records (pre-migration) are treated as recordings — they stay visible in the History window.
+
+### 4. AudioTranscribeView Rewrite (`VoiceS/Views/AudioTranscribeView.swift`)
+
+**Removed**:
+- `TranscriptionResultView` display (full text after transcription)
+- `MarkdownDownloadButton` (both the usage and the private struct definition at EOF)
+- References to `transcriptionManager.currentTranscription` and `transcriptionManager.currentTranscriptionMarkdown` in the view
+
+**Added**:
+- `@Query` with `#Predicate<Transcription> { $0.source == "file" }`, sorted by timestamp descending
+- `@State private var showFullHistory = false`
+- `fileTranscriptionHistorySection` — shows "Recent Transcriptions" header + up to 5 rows + "View More" button
+- `fileTranscriptionRow(_:)` — compact row with: file icon, original filename (fallback to audioFileURL), duration (HH:MM:SS), date, status indicator (green checkmark / red X), copy button, save-as-MD button
+- `fileTranscriptionFullHistorySheet` — modal with full scrollable list + "Done" button, min 500×400
+- `saveAsMarkdown(text:fileName:)` — reconstructs markdown with `# Transcription` header + date (same pattern as existing `AnimatedSaveButton`)
+- `formatDurationLong(_:)` — formats duration with hours support (existing `formatDuration` only did MM:SS)
+
+**Copy button** uses `ClipboardManager.copyToClipboard(bestText)` where `bestText = transcription.enhancedText ?? transcription.text`.
+
+**Save button** uses `NSSavePanel` directly — compact icon-only button, not the full `AnimatedSaveButton` capsule which would be too large for list rows.
+
+## What worked
+
+- **Build succeeds** — all changes compile cleanly with `xcodebuild -project VoiceS.xcodeproj -scheme VoiceS -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build`
+- **SwiftData lightweight migration** — adding optional `String?` fields with nil defaults works without `VersionedSchema`
+- **`source != "file"` predicate** — correctly handles nil (legacy records pass through)
+- **Reusing `ClipboardManager.copyToClipboard`** — `@discardableResult` static method, works seamlessly
+
+## What didn't work / gotchas discovered during planning
+
+- **`audioFileURL` as filename source** — DOESN'T contain the original filename. `AudioFileTranscriptionManager.startProcessing` renames files to `transcribed_UUID.ext`. Had to add `originalFileName` field. The explore agent during planning caught this.
+- **`transcriptionStatus` always `.pending` for file transcriptions** — `AudioFileTranscriptionManager` never set it to `.completed`. The feasibility reviewer caught this. Fixed by passing `.completed` at all 3 creation sites.
+- **Server markdown not persisted** — `AudioTranscriptionManager.currentTranscriptionMarkdown` is an in-memory `@Published var`, lost on app restart. Instead of adding a model field, we reconstruct markdown from text (same pattern as `AnimatedSaveButton`). The scope guardian reviewer recommended this simpler approach.
+- **`AnimatedCopyButton` and `AnimatedSaveButton` too large for list rows** — These are capsule-shaped with text labels. Created compact icon-only buttons inline instead.
+- **History window had an unfiltered code path** — `cursorQueryDescriptor()` with no search text AND no cursor previously had NO predicate at all. Added a source-filter-only predicate for this branch.
+
+## Files changed
+
+| File | Lines changed | What |
+|------|--------------|------|
+| `VoiceS/Models/Transcription.swift` | +6 | `source`, `originalFileName` fields + init params |
+| `VoiceS/Services/AudioFileTranscriptionManager.swift` | +9 | 3 creation sites: source, originalFileName, completed status |
+| `VoiceS/Services/AudioFileTranscriptionService.swift` | +9 | 3 creation sites: source, originalFileName, completed status |
+| `VoiceS/Whisper/VoiceSEngine.swift` | +1 | 1 creation site: source = "recording" |
+| `VoiceS/Views/History/TranscriptionHistoryView.swift` | +15 | 4 query sites filtered by source != "file" |
+| `VoiceS/Views/AudioTranscribeView.swift` | +120, -70 | Removed result display, added history list + sheet |
+| `docs/brainstorms/2026-04-10-transcribe-audio-history-list-requirements.md` | new | Requirements doc |
+
+## Current git state
+
+All changes from this session are UNCOMMITTED (on top of the also-uncommitted changes from session 2). `git status` will show all files from both sessions.
+
+## Remaining work
+
+1. **Commit and push** — all sessions' changes are uncommitted. Suggest splitting into two commits:
+   - `fix: resolve upload failures and redesign progress UI` (session 2 changes)
+   - `feat: inline history list in Transcribe Audio tab` (session 3 changes)
+   - Or one combined commit if simpler
+2. **Runtime smoke test** — `make local && open ~/Downloads/VoiceS.app`
+   - Transcribe a file → should NOT show full text result, instead a new row appears in the history list
+   - Copy button on row → copies text to clipboard
+   - Save button on row → opens save dialog for .md
+   - Restart app → history list persists
+   - Open History window → should NOT show file transcription entries
+   - Do a live recording → should still appear in History window
+   - Transcribe >5 files → "View More" button appears, opens modal
+3. **Unit tests** — still not written (carried from sessions 1-2)
+4. **Cloudflare fallback** — still no auto-detection between Tailscale/Cloudflare endpoints
+
+## If you only have time for one thing
+
+Run `make local && open ~/Downloads/VoiceS.app`. Drop an audio file in the Transcribe Audio tab. After transcription:
+- You should see a compact row with the filename, duration, date, and copy/save icons — NOT the full text
+- The History window (separate window) should NOT show this file transcription
+- Copy button should put the transcription text on clipboard
+- Save button should offer a .md download

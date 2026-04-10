@@ -27,6 +27,7 @@ struct TranscriptionHistoryView: View {
 
     private static func createLatestTranscriptionIndicatorDescriptor() -> FetchDescriptor<Transcription> {
         var descriptor = FetchDescriptor<Transcription>(
+            predicate: #Predicate<Transcription> { $0.source != "file" },
             sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
         )
         descriptor.fetchLimit = 1
@@ -41,22 +42,29 @@ struct TranscriptionHistoryView: View {
         if let timestamp = timestamp {
             if !searchText.isEmpty {
                 descriptor.predicate = #Predicate<Transcription> { transcription in
+                    transcription.source != "file" &&
                     (transcription.text.localizedStandardContains(searchText) ||
                     (transcription.enhancedText?.localizedStandardContains(searchText) ?? false)) &&
                     transcription.timestamp < timestamp
                 }
             } else {
                 descriptor.predicate = #Predicate<Transcription> { transcription in
+                    transcription.source != "file" &&
                     transcription.timestamp < timestamp
                 }
             }
         } else if !searchText.isEmpty {
             descriptor.predicate = #Predicate<Transcription> { transcription in
-                transcription.text.localizedStandardContains(searchText) ||
-                (transcription.enhancedText?.localizedStandardContains(searchText) ?? false)
+                transcription.source != "file" &&
+                (transcription.text.localizedStandardContains(searchText) ||
+                (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
+            }
+        } else {
+            descriptor.predicate = #Predicate<Transcription> { transcription in
+                transcription.source != "file"
             }
         }
-        
+
         descriptor.fetchLimit = pageSize
         return descriptor
     }
@@ -441,8 +449,13 @@ struct TranscriptionHistoryView: View {
 
             if !searchText.isEmpty {
                 allDescriptor.predicate = #Predicate<Transcription> { transcription in
-                    transcription.text.localizedStandardContains(searchText) ||
-                    (transcription.enhancedText?.localizedStandardContains(searchText) ?? false)
+                    transcription.source != "file" &&
+                    (transcription.text.localizedStandardContains(searchText) ||
+                    (transcription.enhancedText?.localizedStandardContains(searchText) ?? false))
+                }
+            } else {
+                allDescriptor.predicate = #Predicate<Transcription> { transcription in
+                    transcription.source != "file"
                 }
             }
 

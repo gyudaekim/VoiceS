@@ -17,6 +17,11 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
     private let pollInterval: UInt64 = 2_500_000_000 // 2.5 s in nanoseconds
     /// Maximum wall-clock polling duration before giving up (2 hours).
     private let maxPollDuration: TimeInterval = 7200
+    /// Upload timeout — large audio files need more than the default 60 s.
+    private let uploadTimeoutInterval: TimeInterval = 600 // 10 minutes
+
+    /// Holds the progress callback during upload so the delegate can reach it.
+    private var uploadProgressCallback: ((LongAudioProgress) -> Void)?
 
     init(baseURL: URL, apiKey: String?) {
         self.baseURL = baseURL
@@ -67,11 +72,11 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
 
         progress(LongAudioProgress(
             status: .uploading,
-            message: "Uploading audio to server…",
+            message: "Preparing upload…",
             progressPercent: 0
         ))
 
-        let jobId = try await submitJob(audioURL: audioURL, languageHint: languageHint)
+        let jobId = try await submitJob(audioURL: audioURL, languageHint: languageHint, progress: progress)
         // Validate jobId shape — the server controls this value and we interpolate it into URL paths.
         guard jobId.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else {
             throw LongAudioTranscriptionError.invalidServerResponse("Invalid job_id format: \(jobId.prefix(50))")
@@ -110,6 +115,12 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
 
     /// Quick health check to confirm the server at `baseURL` is actually a Qwen ASR server
     /// with async job support, not a generic OpenAI-compatible host.
+    ///
+    /// - If the server IS reachable but doesn't respond like a Qwen ASR server (non-200 or
+    ///   missing `"status": "ok"`), throws `asyncJobsNotSupported` → the manager falls back
+    ///   to `ClientChunkingStrategy` gracefully.
+    /// - If the server is NOT reachable (network error, ATS, DNS, timeout), the original
+    ///   error is re-thrown so the user sees a meaningful message instead of a silent fallback.
     private func verifyServerSupportsAsyncJobs() async throws {
         let healthURL = baseURL.appendingPathComponent("/health")
         var request = URLRequest(url: healthURL)
@@ -118,33 +129,45 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
         if let apiKey = apiKey {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+
+        let data: Data
+        let response: URLResponse
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                throw LongAudioTranscriptionError.asyncJobsNotSupported
-            }
-            // Verify the response looks like a Qwen ASR health check (has "status": "ok").
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               json["status"] as? String == "ok" {
-                logger.info("Server health check passed")
-            } else {
-                throw LongAudioTranscriptionError.asyncJobsNotSupported
-            }
-        } catch let error as LongAudioTranscriptionError {
-            throw error
+            (data, response) = try await URLSession.shared.data(for: request)
         } catch {
-            // Network error, timeout, etc. — server is not reachable at this base URL.
+            // Network error, ATS violation, DNS failure, timeout, etc.
+            // Let the original error propagate so the user sees what actually went wrong
+            // instead of a silent fallback to client chunking.
+            logger.error("Server health check network error: \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
+
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            // Server is reachable but doesn't have a /health endpoint → probably not a
+            // Qwen ASR server. Fall back gracefully.
+            throw LongAudioTranscriptionError.asyncJobsNotSupported
+        }
+
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           json["status"] as? String == "ok" {
+            logger.info("Server health check passed at \(healthURL.absoluteString, privacy: .public)")
+        } else {
             throw LongAudioTranscriptionError.asyncJobsNotSupported
         }
     }
 
     // MARK: - Submit
 
-    private func submitJob(audioURL: URL, languageHint: String) async throws -> String {
+    private func submitJob(
+        audioURL: URL,
+        languageHint: String,
+        progress: @escaping (LongAudioProgress) -> Void
+    ) async throws -> String {
         let endpoint = baseURL.appendingPathComponent("/v1/jobs/transcriptions")
         let boundary = "Boundary-\(UUID().uuidString)"
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = uploadTimeoutInterval
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         if let apiKey = apiKey {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -157,7 +180,27 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
         )
         defer { try? FileManager.default.removeItem(at: bodyFileURL) }
 
-        let (data, response) = try await URLSession.shared.upload(for: request, fromFile: bodyFileURL)
+        let totalBytes = (try? FileManager.default.attributesOfItem(atPath: bodyFileURL.path)[.size] as? Int64) ?? 0
+
+        // Use a delegate-based session to track upload bytes progress.
+        let delegate = UploadProgressDelegate { bytesSent, totalExpected in
+            let percent = totalExpected > 0 ? Double(bytesSent) / Double(totalExpected) * 100.0 : 0
+            let sentMB = String(format: "%.1f", Double(bytesSent) / 1_048_576)
+            let totalMB = String(format: "%.1f", Double(totalExpected) / 1_048_576)
+            progress(LongAudioProgress(
+                status: .uploading,
+                message: "Uploading \(sentMB) / \(totalMB) MB…",
+                progressPercent: percent   // 0–100% of upload bytes
+            ))
+        }
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = uploadTimeoutInterval
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        logger.info("Uploading \(totalBytes, privacy: .public) bytes to \(endpoint.absoluteString, privacy: .public)")
+
+        let (data, response) = try await session.upload(for: request, fromFile: bodyFileURL)
         try Self.validate(response: response, data: data, context: "submitJob")
 
         guard let job = try? JSONDecoder().decode(JobStatusResponse.self, from: data),
@@ -273,7 +316,8 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
             let job = try JSONDecoder().decode(JobStatusResponse.self, from: data)
             let mapped = mapStatus(job)
 
-            // Clamp server-reported progress to 0–100 for safe ProgressView binding.
+            // Pass through server progress as-is (0–100 overall). The UI derives per-chunk
+            // progress from this + currentChunk/totalChunks.
             let clampedPercent: Double? = job.progressPercent.map { max(0, min(100, $0)) }
 
             progress(LongAudioProgress(
@@ -434,5 +478,26 @@ final class QwenServerJobStrategy: LongAudioTranscriptionStrategy {
             case detectedLanguage = "detected_language"
             case resultUrl = "result_url"
         }
+    }
+}
+
+// MARK: - Upload progress delegate
+
+/// Tracks bytes sent during multipart upload and reports via a callback.
+private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    private let onProgress: @Sendable (Int64, Int64) -> Void
+
+    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        onProgress(totalBytesSent, totalBytesExpectedToSend)
     }
 }

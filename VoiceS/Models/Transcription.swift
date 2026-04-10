@@ -25,6 +25,8 @@ final class Transcription {
     var powerModeName: String?
     var powerModeEmoji: String?
     var transcriptionStatus: String?
+    var source: String?           // "file" or "recording", nil = legacy (treated as recording)
+    var originalFileName: String? // User's original filename before rename to transcribed_UUID.ext
 
     init(text: String,
          duration: TimeInterval,
@@ -39,6 +41,8 @@ final class Transcription {
          aiRequestUserMessage: String? = nil,
          powerModeName: String? = nil,
          powerModeEmoji: String? = nil,
+         source: String? = nil,
+         originalFileName: String? = nil,
          transcriptionStatus: TranscriptionStatus = .pending) {
         self.id = UUID()
         self.text = text
@@ -55,6 +59,8 @@ final class Transcription {
         self.aiRequestUserMessage = aiRequestUserMessage
         self.powerModeName = powerModeName
         self.powerModeEmoji = powerModeEmoji
+        self.source = source
+        self.originalFileName = originalFileName
         self.transcriptionStatus = transcriptionStatus.rawValue
     }
 }
